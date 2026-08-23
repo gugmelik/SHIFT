@@ -3,6 +3,10 @@ data/*
 !data/reference_images/
 data/reference_images/*
 !data/reference_images/README.md
+!data/reference_images/*.jpg
+!data/reference_images/*.jpeg
+!data/reference_images/*.png
+!data/reference_images/*.webp
 remove_experiments/
 remove_experiments_flux_schnell/
 style_experiments/

@@ -60,11 +60,11 @@ Dumps are compact prompt-means per `(step, layer, stream)`, plus a token-pooled 
 
 ### 2.3 Calculate (`scripts/steering_calculate_klein.sh`)
 
-For each timestep \(t\), block \(\ell\), and stream \(s \in \{\text{img}, \text{txt}\}\):
+For each timestep t, block ℓ, and stream s (img or txt), the steering vector is the difference of mean activations:
 
-\[
-v_{t,\ell,s} \;=\; \mathbb{E}[h^{\text{pos}}_{t,\ell,s}] \;-\; \mathbb{E}[h^{\text{neg}}_{t,\ell,s}]
-\]
+```text
+v(t, ℓ, s) = mean(h_pos) − mean(h_neg)
+```
 
 That is a **constant offset** in activation space: “what the reference image added, on average, relative to prompt-only T2I.” An optional linear SVM is trained on the same pos/neg pools so apply-time `--use_cls` can scale the offset by how “styled” the current activation looks.
 
@@ -74,16 +74,14 @@ The calculator is the shared SHIFT script `src/steering/calculate_steering_vecto
 
 Generation is **pure T2I**. No reference image is passed; token lengths must match the sliced extract. Forward hooks on the same 8 blocks add the unit steering vector on the chosen stream(s), then **renormalize** to the original activation norm so magnitude does not explode:
 
-\[
-h \;\leftarrow\; \mathrm{renorm}\!\left(h + \alpha \cdot \hat{v} \cdot \sigma\right)
-\]
+<p align="center"><i>h</i> ← renorm(<i>h</i> + α · <i>v̂</i> · σ)</p>
 
 | Knob | Stream | Role in this test |
 | --- | --- | --- |
-| `strength` (\(\alpha_{\text{txt}}\)) | text tokens | **0** for all three styles |
-| `strength_img` (\(\alpha_{\text{img}}\)) | image tokens | **0** for Picasso and Luca; **6, 7, 12** for sketch |
+| `strength` (text-stream α) | text tokens | **0** for all three styles |
+| `strength_img` (image-stream α) | image tokens | **0** for Picasso and Luca; **6, 7, 12** for sketch |
 
-\(\sigma\) is 1 unless `--use_cls` is on. Task is `add concept` (add the vector, do not subtract). `--steering_type separate` keeps a per-token vector rather than collapsing to a single mean.
+The classifier scale σ is 1 unless `--use_cls` is on. Task is `add concept` (add the vector, do not subtract). `--steering_type separate` keeps a per-token vector rather than collapsing to a single mean.
 
 Text-encoder steering (`--steer_txt` / `--strength_txt`) is unused: Klein’s Qwen3 encoder is not hooked.
 
@@ -110,7 +108,7 @@ flowchart LR
 ### 2.5 What this is *not*
 
 - Not IP-Adapter / style LoRA training: no extra weights at extract time; the only learned object is a mean-diff (and optional SVM).
-- Not img2img from the reference latent: apply starts from noise; the reference only influenced the teacher activations used to build \(v\).
+- Not img2img from the reference latent: apply starts from noise; the reference only influenced the teacher activations used to build the steering vector.
 - Not a prompt rewrite: the apply prompt is the raw subject line, with no “in the style of …” suffix.
 
 ---
@@ -179,7 +177,7 @@ Both are interesting. The second is probably **not** the operating point we want
 | Color palette and coarse texture transfer on unseen-looking styles | Reference tokens *do* inject a style-like signal that text-only SHIFT cannot invent |
 | Brushwork / drawing grammar / illustrator identity are incomplete | Mean-diff is too coarse: one vector averages content, layout, and style |
 | Prompt subject usually remains recognizable | Good news for T2I apply without the photo |
-| Large `strength_img` blends prompt into the reference | Img-stream \(v\) is content-contaminated; we need a mapping, not a bigger \(\alpha\) |
+| Large `strength_img` blends prompt into the reference | Img-stream *v* is content-contaminated; we need a mapping, not a bigger α |
 | Text-stream `strength = 0` in this test | All visible effect is from Klein I2I (teacher) and/or img-stream steering |
 
 The qualitative bar for this round is **not** “beats a style the model already knows.” It is “does the teacher exist, and does a linear offset do anything with it?” The answer is yes, weakly: room for a better extractor of the same pos/neg pair.
@@ -188,18 +186,24 @@ The qualitative bar for this round is **not** “beats a style the model already
 
 ## 6. Next step: shallow network instead of mean-diff
 
-A single vector \(v = \bar{h}_{\text{pos}} - \bar{h}_{\text{neg}}\) is prompt-agnostic. It cannot say “keep this ice bear, only change the marks.” That is likely why large `strength_img` drags in reference layout.
+A single mean-diff vector is prompt-agnostic:
+
+<p align="center"><i>v</i> = <i>h̄</i><sub>pos</sub> − <i>h̄</i><sub>neg</sub></p>
+
+It cannot say “keep this ice bear, only change the marks.” That is likely why large `strength_img` drags in reference layout.
 
 **Proposal.** Train a **shallow network** (linear layer, or a small MLP per block/stream) that maps **negative** activations to **positive** ones:
 
 | | |
 | --- | --- |
-| Input | \(h^{\text{neg}}\) — activations from prompt-only T2I |
-| Target | \(h^{\text{pos}}\) — activations from the same prompt + reference image |
+| Input | negative activations from prompt-only T2I |
+| Target | positive activations from the same prompt + reference image |
 | Loss | e.g. cosine / MSE on hidden states (optionally per token, with ref tokens still sliced) |
-| Inference | run T2I, replace or residual-add \(f(h)\) at the same hooks, **no reference image** |
+| Inference | run T2I, replace or residual-add the network output at the same hooks, **no reference image** |
 
-That is a **prompt-conditioned** style map: \(f\) can leave content directions alone if they are shared by pos and neg, and only move the residual that the reference actually changed. Residual training \(f(h) \approx h_{\text{pos}} - h_{\text{neg}}\) with \(h_{\text{apply}} \leftarrow h + f(h)\) is the natural SHIFT-shaped variant.
+That is a **prompt-conditioned** style map: the network can leave content directions alone if they are shared by pos and neg, and only move the residual that the reference actually changed. Residual training is the natural SHIFT-shaped variant:
+
+<p align="center"><i>f</i>(<i>h</i>) ≈ <i>h</i><sub>pos</sub> − <i>h</i><sub>neg</sub>,  <i>h</i><sub>apply</sub> ← <i>h</i> + <i>f</i>(<i>h</i>)</p>
 
 If generations look closer to the teacher (and farther from the high-strength blend), then measure style fidelity.
 
@@ -209,7 +213,7 @@ Do **not** spend GPU on metrics until the pictures improve. Then:
 
 - **DINOv2 cosine similarity** between each generated image and the **reference style image** (reuse `metrics/dino.py`, but pair against the style photo rather than against unstyled origin). Higher should mean the sample lives closer to the reference’s visual neighborhood.
 - Optional controls: DINOv2 vs the **unstyled** origin (content preservation — should stay high) and CLIP text–image on the raw prompt (subject preservation).
-- Teacher ceiling: DINOv2(reference, positive I2I images). Apply-time T2I with \(f\) should approach that ceiling without needing `image=` at generate time.
+- Teacher ceiling: DINOv2(reference, positive I2I images). Apply-time T2I with the mapper should approach that ceiling without needing `image=` at generate time.
 
 ---
 

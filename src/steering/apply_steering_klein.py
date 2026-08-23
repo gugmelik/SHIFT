@@ -38,16 +38,18 @@ def load_prompts(prompt_path: str, num_prompts: Optional[int] = None):
 
 def find_vector_file(data_dir: str, vector_type: str) -> str:
     suffix_candidates = [f"_{vector_type}.pt", f"{vector_type}.pt"]
+    skip_substrings = ("text_", "svm_models", "scores", "normals")
     candidates = [
         os.path.join(data_dir, name)
         for name in os.listdir(data_dir)
         if name.endswith(".pt")
-        and "text_" not in name
+        and not any(skip in name for skip in skip_substrings)
         and any(name.endswith(suffix) for suffix in suffix_candidates)
     ]
     if not candidates:
         raise FileNotFoundError(
-            f"No vector file in '{data_dir}' ending with '{vector_type}.pt'"
+            f"No vector file in '{data_dir}' ending with '{vector_type}.pt'. "
+            "Run scripts/steering_calculate_klein.sh first."
         )
     if len(candidates) > 1:
         raise RuntimeError(f"Multiple vector candidates: {candidates}")
@@ -209,8 +211,28 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--strength", type=float, default=10.0, help="Text-branch strength")
-    parser.add_argument("--strength_img", type=float, default=10.0, help="Image-branch strength")
-    parser.add_argument("--steering_type", type=str, default="mean", choices=["mean", "separate"])
+    parser.add_argument("--strength_img", type=float, default=0.0, help="Image-branch strength")
+    parser.add_argument(
+        "--strength_txt",
+        type=float,
+        default=0.0,
+        help="Ignored on Klein (no T5/CLIP text-encoder steering).",
+    )
+    parser.add_argument(
+        "--steer_txt",
+        action="store_true",
+        help="Ignored on Klein (Qwen3 text-encoder steering is not implemented).",
+    )
+    parser.add_argument("--steering_type", type=str, default="separate", choices=["mean", "separate"])
+    parser.add_argument(
+        "--injection_point",
+        type=str,
+        default="block",
+        choices=["block"],
+        help="Klein apply hooks double-stream block residuals (same as extraction).",
+    )
+    parser.add_argument("--top_k_percent", type=float, default=0.95)
+    parser.add_argument("--min_signal_threshold", type=float, default=0.05)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--block_steering", type=str, default="all")
     parser.add_argument("--t_steering", type=str, default="all")
@@ -218,7 +240,27 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--results_dir", type=str, default="experiments/klein_9b/style/generated_images")
+    parser.add_argument(
+        "--save_origin",
+        action="store_true",
+        help="Also generate unsteered T2I images for visual comparison.",
+    )
     return parser.parse_args()
+
+
+def generate_one(pipe, prompt, args, device, seed, callback=None):
+    kwargs = dict(
+        prompt=prompt,
+        num_inference_steps=args.inference_steps,
+        guidance_scale=args.guidance_scale,
+        width=args.width,
+        height=args.height,
+        generator=torch.Generator(device).manual_seed(int(seed)),
+    )
+    if callback is not None:
+        kwargs["callback_on_step_end"] = callback
+        kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+    return pipe(**kwargs).images[0]
 
 
 def main():
@@ -234,13 +276,34 @@ def main():
     if torch.cuda.is_available():
         pipe.to("cuda")
 
+    if not os.path.isdir(args.data_dir):
+        raise FileNotFoundError(
+            f"data_dir not found: {args.data_dir}. Run scripts/steering_calculate_klein.sh first."
+        )
+    print(f"Vector dir contents: {sorted(os.listdir(args.data_dir))}")
     vector_path = find_vector_file(args.data_dir, args.vector_type)
     vector = torch.load(vector_path, map_location="cpu", weights_only=False)
     print(f"Loaded: {vector_path}")
+    if args.steer_txt or args.strength_txt:
+        print("WARNING: --steer_txt / --strength_txt are ignored on Klein (no T5/CLIP encoder).")
 
     prompts = load_prompts(args.prompts_path, args.num_prompts)
     steered_dir = os.path.join(args.results_dir, "steered")
+    origin_dir = os.path.join(args.results_dir, "origin")
     os.makedirs(steered_dir, exist_ok=True)
+    if args.save_origin:
+        os.makedirs(origin_dir, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.save_origin:
+        for idx, prompt in enumerate(tqdm(prompts, desc="Origin T2I")):
+            sanitized = prompt.replace(" ", "_").replace("/", "").replace(",", "")[:50]
+            origin_path = os.path.join(origin_dir, f"{idx:02d}_{sanitized}_origin.png")
+            if os.path.exists(origin_path):
+                continue
+            generate_one(pipe, prompt, args, device, int(args.seed) + idx).save(origin_path)
+        print(f"Saved origin images to {origin_dir}")
 
     hook_state, remove_hooks = apply_attention_steering(pipe, args, vector)
 
@@ -248,7 +311,6 @@ def main():
         hook_state["step"] = step_index + 1
         return callback_kwargs
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         for idx, prompt in enumerate(tqdm(prompts, desc="Steered T2I")):
             sanitized = prompt.replace(" ", "_").replace("/", "").replace(",", "")[:50]
@@ -256,24 +318,18 @@ def main():
             out_path = os.path.join(steered_dir, f"{idx:02d}_{sanitized}_{suffix}.png")
             if os.path.exists(out_path):
                 continue
-
             hook_state["step"] = 0
-            generator = torch.Generator(device).manual_seed(int(args.seed) + idx)
-            images = pipe(
-                prompt,
-                num_inference_steps=args.inference_steps,
-                guidance_scale=args.guidance_scale,
-                width=args.width,
-                height=args.height,
-                generator=generator,
-                callback_on_step_end=_on_step_end,
-                callback_on_step_end_tensor_inputs=["latents"],
-            ).images
-            images[0].save(out_path)
+            generate_one(
+                pipe, prompt, args, device, int(args.seed) + idx, callback=_on_step_end
+            ).save(out_path)
     finally:
         remove_hooks()
 
     print(f"Saved steered images to {steered_dir}")
+    print(
+        f"Check: compare {steered_dir} vs "
+        f"{origin_dir if args.save_origin else 'unsteered T2I (rerun with --save_origin)'}."
+    )
 
 
 if __name__ == "__main__":

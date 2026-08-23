@@ -110,6 +110,7 @@ class DualStreamHookManager:
         self.n_gen_tokens = n_gen_tokens
         self.sums: Dict = {}
         self.counts: Dict = {}
+        self.pooled: Dict = {}
         self.reset_state()
 
     def reset_state(self):
@@ -136,19 +137,24 @@ class DualStreamHookManager:
         if step not in self.sums:
             self.sums[step] = {}
             self.counts[step] = {}
+            self.pooled[step] = {}
         layer_key = f"layer_{block_idx}"
         if layer_key not in self.sums[step]:
             self.sums[step][layer_key] = {}
             self.counts[step][layer_key] = {}
+            self.pooled[step][layer_key] = {}
         # Sum over the batch dim immediately; keep float32 running totals.
         sample_sum = tensor.detach().float().sum(dim=0).cpu()
         n = int(tensor.shape[0])
         if branch not in self.sums[step][layer_key]:
             self.sums[step][layer_key][branch] = sample_sum
             self.counts[step][layer_key][branch] = n
+            self.pooled[step][layer_key][branch] = []
         else:
             self.sums[step][layer_key][branch] += sample_sum
             self.counts[step][layer_key][branch] += n
+        # Token-mean per sample for SVM: (B, D), tiny compared to (B, T, D).
+        self.pooled[step][layer_key][branch].append(tensor.detach().float().mean(dim=1).cpu())
 
     def _slice_generated_img(self, img: torch.Tensor) -> torch.Tensor:
         if self.n_gen_tokens is None:
@@ -175,15 +181,21 @@ class DualStreamHookManager:
 
     def aggregate(self) -> Dict:
         result = {}
+        pooled = {}
         for step, layers in self.sums.items():
             result[step] = {}
+            pooled[step] = {}
             for layer_key, branches in layers.items():
                 result[step][layer_key] = {}
+                pooled[step][layer_key] = {}
                 for branch, total in branches.items():
                     n = self.counts[step][layer_key][branch]
                     mean = total / max(n, 1)
                     # (1, T, D) so calculate_steering_vectors mean(0) still works.
                     result[step][layer_key][branch] = mean.unsqueeze(0).to(torch.float16)
+                    stacked = torch.cat(self.pooled[step][layer_key][branch], dim=0)
+                    pooled[step][layer_key][branch] = stacked.to(torch.float16)
+        result["pooled"] = pooled
         return result
 
 
@@ -231,10 +243,15 @@ def run_extraction(pipe, prompts, args, reference_image=None) -> Tuple[Dict, Lis
             handle.remove()
 
     vectors = manager.aggregate()
+    pooled = vectors.get("pooled", {})
     for step in sorted(k for k in vectors if isinstance(k, int)):
         for layer_key in sorted(vectors[step].keys()):
             shapes = {branch: tuple(tensor.shape) for branch, tensor in vectors[step][layer_key].items()}
-            print(f"  step {step} {layer_key}: {shapes}")
+            pooled_shapes = {
+                branch: tuple(tensor.shape)
+                for branch, tensor in pooled.get(step, {}).get(layer_key, {}).items()
+            }
+            print(f"  step {step} {layer_key}: means {shapes} pooled {pooled_shapes}")
         break
     return vectors, all_images
 

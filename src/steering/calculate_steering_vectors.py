@@ -21,9 +21,21 @@ CLASSIFIER_CONFIGS = {
 
 # --- 2. Enhanced Training Logic ---
 def prepare_data_slice(act, indices, n_samples):
-    X = act.squeeze(1)[:, indices].mean(1)[:n_samples].float()
-    norm = X.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    return X / norm
+    """Token-mean features -> (n_samples, hidden). Also accepts already-pooled (N, D)."""
+    act = act.float()
+    while act.dim() > 3 and act.shape[1] == 1:
+        act = act.squeeze(1)
+    if act.dim() == 2:
+        X = act[:n_samples]
+    else:
+        if act.dim() > 3:
+            act = act.reshape(-1, act.shape[-2], act.shape[-1])
+        if indices is not None:
+            if isinstance(indices, torch.Tensor):
+                indices = indices.to(dtype=torch.long, device="cpu")
+            act = act[:, indices]
+        X = act[:n_samples].mean(1)
+    return X / X.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
 def train_classifier(X, y, X_test, y_test, config_key, c_val, seed):
     """
@@ -165,55 +177,120 @@ def calculate_manual_diff_from_paths(pos_path, neg_path, timesteps, blocks, n_sa
 
 # --- 3. Integrated Functional Logic ---
 
+def _iter_svm_branches(pos_layer, neg_layer, token_stream):
+    if isinstance(pos_layer, dict) and ("img" in pos_layer or "txt" in pos_layer):
+        branches = ("img", "txt") if token_stream == "both" else (token_stream,)
+        for branch in branches:
+            if branch in pos_layer and branch in neg_layer:
+                yield branch, pos_layer[branch], neg_layer[branch]
+    elif token_stream in ("txt", "both"):
+        yield "txt", pos_layer, neg_layer
+
+
+def _svm_layer(data, step, layer, token_stream="txt"):
+    """Prefer compact per-sample pooled features saved by get_vector_klein.py."""
+    pooled = data.get("pooled")
+    if pooled is not None and step in pooled and layer in pooled[step]:
+        return pooled[step][layer]
+    return data[step][layer]
+
+
 def train_ensemble_svms_best_tokens(data_pos, data_neg, best_tokens, args):
     models, normals = {}, {}
+    token_stream = getattr(args, "token_stream", "txt")
     scores_array = np.zeros((args.n_ensemble, args.timesteps, args.blocks))
 
     for step in range(args.timesteps):
         models[step], normals[step] = {}, {}
-        
-        for block in range(args.blocks):
-            
-            layer = f'layer_{block}'
-            indices = best_tokens[step][block]['txt'] if best_tokens else torch.arange(data_pos[0][layer]['txt'].shape[-2])
-            if isinstance(indices, torch.Tensor):
-                indices = indices.to(dtype=torch.long, device='cpu')
-           
-            if len(indices) == 0:
-                models[step][f'layer_{block}'] = None
-                normals[step][f'layer_{block}'] = None
-                continue 
-            
-            X_p = prepare_data_slice(data_pos[step][layer]['txt'], indices, args.n_samples)
-            X_n = prepare_data_slice(data_neg[step][layer]['txt'], indices, args.n_samples)
-            X, y = np.vstack([X_p.cpu().numpy(), X_n.cpu().numpy()]), np.concatenate([np.ones(len(X_p)), np.zeros(len(X_n))])
-            #print(torch.from_numpy(X).norm(dim=-1))
-            coefs = []
-            models_ensemble = []
-            for i in range(args.n_ensemble):
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, 
-                    test_size=0.4, 
-                    random_state=args.random_seed_base + i,
-                    stratify=y, 
-                    shuffle=True,
-                )
-            
-                m, c, s = train_classifier(X_train, y_train, X_test, y_test, args.classifier, args.c_val, args.random_seed_base + i)
-                models_ensemble.append(m)
-                if c is not None:
-                    coefs.append(c)
-                scores_array[i, step, block] = s
-            
-            if coefs:
-                normals[step][layer] = torch.stack(coefs)
-            else:
-                normals[step][layer] = None 
 
-            models[step][layer] = models_ensemble
-            
-            print(f"[{args.classifier}] Step {step}, Block {block}. Mean Score: {np.mean(scores_array[:, step, block]):.4f}, {X_train.shape}")
-            
+        for block in range(args.blocks):
+            layer = f"layer_{block}"
+            pos_layer = _svm_layer(data_pos, step, layer, token_stream)
+            neg_layer = _svm_layer(data_neg, step, layer, token_stream)
+
+            sample_tensor = None
+            if isinstance(pos_layer, dict):
+                sample_tensor = next(
+                    (val for val in pos_layer.values() if torch.is_tensor(val)),
+                    None,
+                )
+            elif torch.is_tensor(pos_layer):
+                sample_tensor = pos_layer
+            n_pos = int(sample_tensor.shape[0]) if sample_tensor is not None else None
+            if n_pos is not None and n_pos < 2:
+                raise ValueError(
+                    "SVM needs per-sample activations, but this dump has "
+                    f"N={n_pos} at step {step} {layer}. Re-run get_vector_klein.py "
+                    "(it now stores a compact 'pooled' (N, D) entry) and point "
+                    "--pos_path/--neg_path at those files."
+                )
+
+            branch_models, branch_normals = {}, {}
+            branch_scores = []
+            for branch, pos_act, neg_act in _iter_svm_branches(pos_layer, neg_layer, token_stream):
+                if best_tokens is not None:
+                    token_info = best_tokens[step][block]
+                    indices = token_info[branch] if isinstance(token_info, dict) else token_info
+                else:
+                    indices = None
+                    if pos_act.dim() >= 3:
+                        indices = torch.arange(pos_act.shape[-2])
+                if isinstance(indices, torch.Tensor) and len(indices) == 0:
+                    continue
+
+                X_p = prepare_data_slice(pos_act, indices, args.n_samples)
+                X_n = prepare_data_slice(neg_act, indices, args.n_samples)
+                X = np.vstack([X_p.cpu().numpy(), X_n.cpu().numpy()])
+                y = np.concatenate([np.ones(len(X_p)), np.zeros(len(X_n))])
+
+                coefs, models_ensemble = [], []
+                split_ok = len(X) >= 10 and min((y == 1).sum(), (y == 0).sum()) >= 2
+                for i in range(args.n_ensemble):
+                    if split_ok:
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            X,
+                            y,
+                            test_size=0.4,
+                            random_state=args.random_seed_base + i,
+                            stratify=y,
+                            shuffle=True,
+                        )
+                    else:
+                        X_train, y_train, X_test, y_test = X, y, X, y
+                    m, c, s = train_classifier(
+                        X_train, y_train, X_test, y_test, args.classifier, args.c_val, args.random_seed_base + i
+                    )
+                    models_ensemble.append(m)
+                    if c is not None:
+                        coefs.append(c)
+                    branch_scores.append(s)
+
+                branch_models[branch] = models_ensemble
+                branch_normals[branch] = torch.stack(coefs) if coefs else None
+                print(
+                    f"[{args.classifier}] Step {step}, Block {block}, {branch}. "
+                    f"Mean Score: {np.mean(branch_scores[-args.n_ensemble:]):.4f}, {X_p.shape}"
+                )
+
+            if not branch_models:
+                models[step][layer] = None
+                normals[step][layer] = None
+                continue
+
+            # Keep Flux txt-only layout when only one branch was trained.
+            if list(branch_models.keys()) == ["txt"]:
+                models[step][layer] = branch_models["txt"]
+                normals[step][layer] = branch_normals["txt"]
+            else:
+                models[step][layer] = branch_models
+                normals[step][layer] = branch_normals
+
+            if branch_scores:
+                scores_array[:, step, block] = np.mean(
+                    np.array(branch_scores).reshape(len(branch_models), args.n_ensemble),
+                    axis=0,
+                )
+
     return models, normals, scores_array
 
 
@@ -226,6 +303,7 @@ def main():
     parser.add_argument('--timesteps', type=int, default=4)
     parser.add_argument('--blocks', type=int, default=19)
     parser.add_argument('--method', choices=['svm', 'diff', 'text'], default='svm')
+    parser.add_argument('--token_stream', choices=['img', 'txt', 'both'], default='txt')
     parser.add_argument('--c_val', type=float, default=0.1)
     parser.add_argument('--n_ensemble', type=int, default=2)
     parser.add_argument('--threshold', type=float, default=0.85)

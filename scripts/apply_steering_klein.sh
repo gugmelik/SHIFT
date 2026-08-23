@@ -1,35 +1,39 @@
 #!/bin/bash
 # Step 3/3 (Klein 9B): apply the style vector at T2I time (no reference image).
-# Run after scripts/steering_calculate_klein.sh
-# Run from repository root: bash scripts/apply_steering_klein.sh
+# Run from repository root:
+#   bash scripts/apply_steering_klein.sh path/to/style.jpg
+#   bash scripts/apply_steering_klein.sh style
 set -euo pipefail
 
-DATA_DIR="experiments/klein_9b/style/final_steering/block_steering"
-RESULTS_DIR="experiments/klein_9b/style/generated_images"
-PROMPTS_PATH="prompts_collection/dataset_creation/dataset_prompts_style.txt"
+SCRIPT_NAME="apply_steering_klein.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CALLER_PWD="$(pwd)"
+cd "${ROOT}"
+# shellcheck source=scripts/_klein_ref_env.sh
+source "${ROOT}/scripts/_klein_ref_env.sh" "${1:-}"
 
-if [[ ! -d "${DATA_DIR}" ]]; then
-  echo "ERROR: ${DATA_DIR} not found. Run scripts/steering_calculate_klein.sh first."
+if [[ ! -d "${VECTOR_DIR}" ]]; then
+  echo "ERROR: ${VECTOR_DIR} not found. Run scripts/steering_calculate_klein.sh first."
   exit 1
 fi
-if ! ls "${DATA_DIR}"/*diff.pt >/dev/null 2>&1; then
-  echo "ERROR: no *_diff.pt in ${DATA_DIR}. Run scripts/steering_calculate_klein.sh first."
-  ls -la "${DATA_DIR}" || true
+if ! ls "${VECTOR_DIR}"/*diff.pt >/dev/null 2>&1; then
+  echo "ERROR: no *_diff.pt in ${VECTOR_DIR}. Run scripts/steering_calculate_klein.sh first."
+  ls -la "${VECTOR_DIR}" || true
   exit 1
 fi
-if ! ls "${DATA_DIR}"/*svm_models.pt >/dev/null 2>&1; then
-  echo "ERROR: no *_svm_models.pt in ${DATA_DIR}. Run scripts/steering_calculate_klein.sh first (SVM step)."
-  ls -la "${DATA_DIR}" || true
+if ! ls "${VECTOR_DIR}"/*svm_models.pt >/dev/null 2>&1; then
+  echo "ERROR: no *_svm_models.pt in ${VECTOR_DIR}. Run scripts/steering_calculate_klein.sh first (SVM step)."
+  ls -la "${VECTOR_DIR}" || true
   exit 1
 fi
-echo "Using vectors in ${DATA_DIR}:"
-ls -lh "${DATA_DIR}"/*.pt
+echo "Using vectors in ${VECTOR_DIR}:"
+ls -lh "${VECTOR_DIR}"/*.pt
 
 mkdir -p "${RESULTS_DIR}"
 
-CUDA_VISIBLE_DEVICES=0 python3 ./src/steering/apply_steering_klein.py \
-    --model_name "black-forest-labs/FLUX.2-klein-9B" \
-    --data_dir "${DATA_DIR}" \
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "${PYTHON}" ./src/steering/apply_steering_klein.py \
+    --model_name "${MODEL_NAME}" \
+    --data_dir "${VECTOR_DIR}" \
     --task "add concept" \
     --strength 45.0 \
     --strength_txt 6.0 \
@@ -49,7 +53,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./src/steering/apply_steering_klein.py \
     --steer_txt \
     --use_cls \
     --save_origin \
-    --prompts_path "${PROMPTS_PATH}"
+    --prompts_path "${PROMPT_PATH}"
 
 echo "Check origin vs steered:"
 echo "  ${RESULTS_DIR}/origin"

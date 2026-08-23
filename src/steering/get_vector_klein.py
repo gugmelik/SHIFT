@@ -8,23 +8,18 @@ Reference tokens are concatenated after generated image tokens:
   hidden_states = [gen_img | ref_img]
 and are sliced off before saving so pos/neg dumps share token lengths.
 
-Output format (compatible with calculate_steering_vectors.py):
-  {
-    step: {
-      "layer_N": {
-        "img": tensor(n_samples, n_img_tokens, hidden_dim),
-        "txt": tensor(n_samples, n_txt_tokens, hidden_dim),
-      },
-      ...
-    },
-    ...
-  }
+Saves compact prompt-means (shape (1, T, D) per stream), not the full
+per-sample stack. A 25-prompt img+txt dump at 1024px is ~16GB and
+torch.save zip-writes often fail with "file write failed" / disk full.
+
+The mean-diff calculator only needs these averages.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -96,7 +91,11 @@ def generator_device() -> str:
 
 
 class DualStreamHookManager:
-    """Collects Klein double-stream block outputs and drops reference tokens."""
+    """Collects Klein double-stream block outputs and drops reference tokens.
+
+    Accumulates a running sum per (step, layer, branch) instead of keeping
+    every sample. RAM and the saved file stay O(tokens), not O(samples).
+    """
 
     def __init__(
         self,
@@ -109,7 +108,8 @@ class DualStreamHookManager:
         self.save_timesteps = save_timesteps
         self.stream = stream
         self.n_gen_tokens = n_gen_tokens
-        self.data: Dict = {}
+        self.sums: Dict = {}
+        self.counts: Dict = {}
         self.reset_state()
 
     def reset_state(self):
@@ -133,12 +133,22 @@ class DualStreamHookManager:
     def _store(self, step: int, block_idx: int, branch: str, tensor: torch.Tensor):
         if not self._wants_branch(branch):
             return
-        if step not in self.data:
-            self.data[step] = {}
+        if step not in self.sums:
+            self.sums[step] = {}
+            self.counts[step] = {}
         layer_key = f"layer_{block_idx}"
-        if layer_key not in self.data[step]:
-            self.data[step][layer_key] = {"img": [], "txt": []}
-        self.data[step][layer_key][branch].append(tensor.detach().cpu())
+        if layer_key not in self.sums[step]:
+            self.sums[step][layer_key] = {}
+            self.counts[step][layer_key] = {}
+        # Sum over the batch dim immediately; keep float32 running totals.
+        sample_sum = tensor.detach().float().sum(dim=0).cpu()
+        n = int(tensor.shape[0])
+        if branch not in self.sums[step][layer_key]:
+            self.sums[step][layer_key][branch] = sample_sum
+            self.counts[step][layer_key][branch] = n
+        else:
+            self.sums[step][layer_key][branch] += sample_sum
+            self.counts[step][layer_key][branch] += n
 
     def _slice_generated_img(self, img: torch.Tensor) -> torch.Tensor:
         if self.n_gen_tokens is None:
@@ -165,13 +175,15 @@ class DualStreamHookManager:
 
     def aggregate(self) -> Dict:
         result = {}
-        for step, layers in self.data.items():
+        for step, layers in self.sums.items():
             result[step] = {}
             for layer_key, branches in layers.items():
                 result[step][layer_key] = {}
-                for branch, tensor_list in branches.items():
-                    if tensor_list:
-                        result[step][layer_key][branch] = torch.stack(tensor_list)
+                for branch, total in branches.items():
+                    n = self.counts[step][layer_key][branch]
+                    mean = total / max(n, 1)
+                    # (1, T, D) so calculate_steering_vectors mean(0) still works.
+                    result[step][layer_key][branch] = mean.unsqueeze(0).to(torch.float16)
         return result
 
 
@@ -225,6 +237,28 @@ def run_extraction(pipe, prompts, args, reference_image=None) -> Tuple[Dict, Lis
             print(f"  step {step} {layer_key}: {shapes}")
         break
     return vectors, all_images
+
+
+def _print_free_disk(path: str):
+    usage = shutil.disk_usage(os.path.abspath(path))
+    print(f"  free disk at {path}: {usage.free / (1024 ** 3):.1f} GB")
+
+
+def atomic_torch_save(obj, path: str):
+    """Write to a temp file then replace, so a failed zip does not leave a half-written .pt."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    _print_free_disk(directory)
+    tmp_path = path + ".tmp"
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    size_gb = os.path.getsize(path) / (1024 ** 3)
+    print(f"  wrote {path} ({size_gb:.2f} GB)")
 
 
 def save_grid(images, path: str):
@@ -321,14 +355,16 @@ def main():
         "n_gen_tokens": args.n_gen_tokens,
         "reference_image": str(ref_path),
         "model_name": args.model_name,
+        "n_samples": n_prompts,
+        "reduced": "prompt_mean",
     }
 
     print("\nRunning Positive Pass (prompt + reference image)...")
     pos_vecs, pos_imgs = run_extraction(pipe, prompts, args, reference_image=reference_image)
     pos_vecs.update(metadata)
     pos_path = os.path.join(args.save_dir, file_template.format("pos"))
-    torch.save(pos_vecs, pos_path)
-    print(f"Saved {pos_path}")
+    print("Saving compact prompt-means (not the full per-sample dump)...")
+    atomic_torch_save(pos_vecs, pos_path)
     del pos_vecs
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -337,8 +373,8 @@ def main():
     neg_vecs, neg_imgs = run_extraction(pipe, prompts, args, reference_image=None)
     neg_vecs.update(metadata)
     neg_path = os.path.join(args.save_dir, file_template.format("neg"))
-    torch.save(neg_vecs, neg_path)
-    print(f"Saved {neg_path}")
+    print("Saving compact prompt-means (not the full per-sample dump)...")
+    atomic_torch_save(neg_vecs, neg_path)
     del neg_vecs
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

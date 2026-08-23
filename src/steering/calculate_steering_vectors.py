@@ -61,7 +61,27 @@ def train_classifier(X, y, X_test, y_test, config_key, c_val, seed):
                 
     return clf, coef, score
 
+def _as_sample_tensor(act):
+    """Normalize activation dumps to (n_samples, n_tokens, hidden)."""
+    while act.dim() > 3 and act.shape[1] == 1:
+        act = act.squeeze(1)
+    if act.dim() == 2:
+        act = act.unsqueeze(0)
+    return act
+
+
+def _layer_streams(layer_val):
+    if isinstance(layer_val, dict) and ("img" in layer_val or "txt" in layer_val):
+        return [key for key in ("img", "txt") if key in layer_val and layer_val[key] is not None]
+    return None
+
+
 def _mean_txt_per_block(data, timesteps, blocks, n_samples=None, best_tokens=None):
+    """Mean over prompts per (step, block).
+
+    Dual-stream dumps ({'img', 'txt'}) return {layer: {'img': t, 'txt': t}}.
+    Legacy txt-only dumps return {layer: tensor}.
+    """
     means = {}
     print(data.keys(), timesteps)
     for step in range(timesteps):
@@ -70,14 +90,24 @@ def _mean_txt_per_block(data, timesteps, blocks, n_samples=None, best_tokens=Non
             layer = f'layer_{block}'
             if best_tokens is not None:
                 indices = best_tokens[step][block]
-                act = data[step][layer].squeeze()[:, indices]
+                act = _as_sample_tensor(data[step][layer])[:, indices]
+                if n_samples is not None:
+                    act = act[:n_samples]
+                means[step][layer] = act.float().mean(0)
             else:
-                act = data[step][layer]['txt'].squeeze()
-
-            if n_samples is not None:
-                act = act[:n_samples]
-
-            means[step][layer] = act.float().mean(0)
+                streams = _layer_streams(data[step][layer])
+                if streams:
+                    means[step][layer] = {}
+                    for stream in streams:
+                        act = _as_sample_tensor(data[step][layer][stream])
+                        if n_samples is not None:
+                            act = act[:n_samples]
+                        means[step][layer][stream] = act.float().mean(0)
+                else:
+                    act = _as_sample_tensor(data[step][layer]['txt'] if isinstance(data[step][layer], dict) else data[step][layer])
+                    if n_samples is not None:
+                        act = act[:n_samples]
+                    means[step][layer] = act.float().mean(0)
             del data[step][layer]
         del data[step]
     return means
@@ -96,6 +126,16 @@ def _mean_txt_per_block_from_path(path, timesteps, blocks, n_samples=None):
     return means
 
 
+def _subtract_layer_means(pos_layer, neg_layer):
+    if isinstance(pos_layer, dict) and isinstance(neg_layer, dict):
+        return {
+            stream: pos_layer[stream] - neg_layer[stream]
+            for stream in pos_layer
+            if stream in neg_layer
+        }
+    return pos_layer - neg_layer
+
+
 def calculate_manual_diff(data_pos, data_neg, timesteps, blocks, best_tokens=None, n_samples=None):
     """Mean diff over prompts: mean(pos) - mean(neg) per (step, block)."""
     pos_means = _mean_txt_per_block(data_pos, timesteps, blocks, n_samples, best_tokens)
@@ -106,7 +146,7 @@ def calculate_manual_diff(data_pos, data_neg, timesteps, blocks, best_tokens=Non
         all_diff[step] = {}
         for block in range(blocks):
             layer = f'layer_{block}'
-            all_diff[step][layer] = pos_means[step][layer] - neg_means[step][layer]
+            all_diff[step][layer] = _subtract_layer_means(pos_means[step][layer], neg_means[step][layer])
     return all_diff
 
 
@@ -120,7 +160,7 @@ def calculate_manual_diff_from_paths(pos_path, neg_path, timesteps, blocks, n_sa
         all_diff[step] = {}
         for block in range(blocks):
             layer = f'layer_{block}'
-            all_diff[step][layer] = pos_means[step][layer] - neg_means[step][layer]
+            all_diff[step][layer] = _subtract_layer_means(pos_means[step][layer], neg_means[step][layer])
     return all_diff
 
 # --- 3. Integrated Functional Logic ---
@@ -210,6 +250,11 @@ def main():
         out_path = f"{prefix}_diff.pt"
         print(f"Saving {out_path} ...", flush=True)
         torch.save(all_diff, out_path)
+        sample = all_diff[0]["layer_0"]
+        if isinstance(sample, dict):
+            print(f"  dual-stream shapes (step 0 layer 0): {{{', '.join(f'{k}: {tuple(v.shape)}' for k, v in sample.items())}}}", flush=True)
+        else:
+            print(f"  txt-only shape (step 0 layer 0): {tuple(sample.shape)}", flush=True)
         print(f"Saved {out_path}", flush=True)
         return
 

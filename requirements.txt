@@ -4,7 +4,7 @@
 
 torch
 torchvision
-diffusers
+diffusers>=0.37.0
 transformers
 accelerate
 safetensors

@@ -1,5 +1,8 @@
 add_experiments_flux_schnell/
-data/
+data/*
+!data/reference_images/
+data/reference_images/*
+!data/reference_images/README.md
 remove_experiments/
 remove_experiments_flux_schnell/
 style_experiments/

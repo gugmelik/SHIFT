@@ -83,23 +83,30 @@ def _ensemble_for_branch(layer_models, branch: str):
 
 def cls_scale(mean_act: torch.Tensor, model, cls_min: float, task: str) -> float:
     """Scale steering by SVM P(class). Does not use calculate_cls_score (add-concept asserts there)."""
-    vec = mean_act.detach().float().cpu()
+    vec = torch.nan_to_num(mean_act.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
     if vec.dim() == 1:
         vec = vec.unsqueeze(0)
+    if not torch.isfinite(vec).all() or vec.norm() < 1e-8:
+        return 1.0
     vec = vec / vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    arr = vec.numpy()
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(arr)
-        if task == "add concept":
-            p_neg = float(proba[0][0])
-            return min(cls_min, 1.0 / ((1.0 - p_neg) + 1e-8) - 1.0)
-        p_pos = float(proba[0][1]) if proba.shape[1] > 1 else float(proba[0][0])
-        return min(cls_min, max(0.0, 1.0 / ((1.0 - p_pos) + 1e-8) - 1.0))
-    if hasattr(model, "decision_function"):
-        dist = float(model.decision_function(arr)[0])
-        if task == "add concept":
-            dist = -dist
-        return min(cls_min, max(0.0, dist))
+    arr = np.nan_to_num(vec.numpy(), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+    if not np.isfinite(arr).all():
+        return 1.0
+    try:
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(arr)
+            if task == "add concept":
+                p_neg = float(proba[0][0])
+                return min(cls_min, 1.0 / ((1.0 - p_neg) + 1e-8) - 1.0)
+            p_pos = float(proba[0][1]) if proba.shape[1] > 1 else float(proba[0][0])
+            return min(cls_min, max(0.0, 1.0 / ((1.0 - p_pos) + 1e-8) - 1.0))
+        if hasattr(model, "decision_function"):
+            dist = float(model.decision_function(arr)[0])
+            if task == "add concept":
+                dist = -dist
+            return min(cls_min, max(0.0, dist))
+    except ValueError:
+        return 1.0
     return 1.0
 
 
@@ -152,16 +159,23 @@ def apply_steering(
     score_val: float = 1.0,
 ) -> torch.Tensor:
     dtype = activations.dtype
-    act_f32 = activations.float()
-    orig_norm = torch.norm(act_f32, dim=-1, keepdim=True) + 1e-6
-    v_unit = steering_vec.float() / (torch.norm(steering_vec.float(), dim=-1, keepdim=True) + 1e-6)
-    score = torch.as_tensor(score_val, device=activations.device, dtype=activations.dtype)
-    adjustment = strength * v_unit.to(activations.dtype) * score
+    act_f32 = torch.nan_to_num(activations.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    orig_norm = torch.norm(act_f32, dim=-1, keepdim=True).clamp(min=1e-6)
+    v_clean = torch.nan_to_num(steering_vec.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    v_unit = v_clean / torch.norm(v_clean, dim=-1, keepdim=True).clamp(min=1e-6)
+    score = torch.nan_to_num(
+        torch.as_tensor(score_val, device=act_f32.device, dtype=act_f32.dtype),
+        nan=1.0,
+        posinf=1.0,
+        neginf=1.0,
+    )
+    adjustment = strength * v_unit * score
     if task == "remove":
-        steered = activations - adjustment
+        steered = act_f32 - adjustment
     else:
-        steered = activations + adjustment
-    steered_unit = steered.float() / (torch.norm(steered.float(), dim=-1, keepdim=True) + 1e-6)
+        steered = act_f32 + adjustment
+    steered = torch.nan_to_num(steered, nan=0.0, posinf=0.0, neginf=0.0)
+    steered_unit = steered / torch.norm(steered, dim=-1, keepdim=True).clamp(min=1e-6)
     return (steered_unit * orig_norm).to(dtype)
 
 
@@ -215,7 +229,9 @@ def apply_attention_steering(pipe, args, vector):
                 current_signal = np.asarray(scores_all[:, step, layer_idx], dtype=np.float32)
             except Exception:
                 current_signal = np.ones(len(ensemble), dtype=np.float32)
-        mean_act = to_modify.float().mean(dim=tuple(range(to_modify.dim() - 1)))
+        mean_act = torch.nan_to_num(
+            to_modify.float(), nan=0.0, posinf=0.0, neginf=0.0
+        ).mean(dim=tuple(range(to_modify.dim() - 1)))
         votes = []
         for i, model in enumerate(ensemble):
             signal = float(current_signal[i]) if i < len(current_signal) else 1.0

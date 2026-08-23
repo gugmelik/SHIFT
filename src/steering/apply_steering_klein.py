@@ -8,11 +8,19 @@ vectors from get_vector_klein.py (generated img tokens + text tokens only).
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import sys
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 from tqdm import tqdm
+
+STEERING_ROOT = Path(__file__).resolve().parents[2]
+if str(STEERING_ROOT) not in sys.path:
+    sys.path.insert(0, str(STEERING_ROOT))
 
 
 def _import_klein_pipeline():
@@ -54,6 +62,45 @@ def find_vector_file(data_dir: str, vector_type: str) -> str:
     if len(candidates) > 1:
         raise RuntimeError(f"Multiple vector candidates: {candidates}")
     return candidates[0]
+
+
+def find_aux_file(data_dir: str, suffix: str) -> Optional[str]:
+    matches = sorted(glob.glob(os.path.join(data_dir, f"*{suffix}")))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        print(f"WARNING: multiple {suffix} files, using {matches[0]}")
+    return matches[0]
+
+
+def _ensemble_for_branch(layer_models, branch: str):
+    if layer_models is None:
+        return None
+    if isinstance(layer_models, dict):
+        return layer_models.get(branch) or layer_models.get("txt")
+    return layer_models
+
+
+def cls_scale(mean_act: torch.Tensor, model, cls_min: float, task: str) -> float:
+    """Scale steering by SVM P(class). Does not use calculate_cls_score (add-concept asserts there)."""
+    vec = mean_act.detach().float().cpu()
+    if vec.dim() == 1:
+        vec = vec.unsqueeze(0)
+    vec = vec / vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    arr = vec.numpy()
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(arr)
+        if task == "add concept":
+            p_neg = float(proba[0][0])
+            return min(cls_min, 1.0 / ((1.0 - p_neg) + 1e-8) - 1.0)
+        p_pos = float(proba[0][1]) if proba.shape[1] > 1 else float(proba[0][0])
+        return min(cls_min, max(0.0, 1.0 / ((1.0 - p_pos) + 1e-8) - 1.0))
+    if hasattr(model, "decision_function"):
+        dist = float(model.decision_function(arr)[0])
+        if task == "add concept":
+            dist = -dist
+        return min(cls_min, max(0.0, dist))
+    return 1.0
 
 
 def split_vector(vector: dict) -> Tuple[dict, dict]:
@@ -102,12 +149,14 @@ def apply_steering(
     steering_vec: torch.Tensor,
     strength: float,
     task: str,
+    score_val: float = 1.0,
 ) -> torch.Tensor:
     dtype = activations.dtype
     act_f32 = activations.float()
     orig_norm = torch.norm(act_f32, dim=-1, keepdim=True) + 1e-6
     v_unit = steering_vec.float() / (torch.norm(steering_vec.float(), dim=-1, keepdim=True) + 1e-6)
-    adjustment = strength * v_unit.to(activations.dtype)
+    score = torch.as_tensor(score_val, device=activations.device, dtype=activations.dtype)
+    adjustment = strength * v_unit.to(activations.dtype) * score
     if task == "remove":
         steered = activations - adjustment
     else:
@@ -134,6 +183,47 @@ def apply_attention_steering(pipe, args, vector):
 
     state = {"step": 0}
     handles = []
+
+    svm_path = find_aux_file(args.data_dir, "_svm_models.pt")
+    scores_path = find_aux_file(args.data_dir, "_scores.pt")
+    models = None
+    scores_all = None
+    if args.use_cls:
+        if svm_path is None:
+            raise FileNotFoundError(
+                f"No *_svm_models.pt in {args.data_dir}. "
+                "Run scripts/steering_calculate_klein.sh (SVM step) first."
+            )
+        models = torch.load(svm_path, map_location="cpu", weights_only=False)
+        print(f"  use_cls models: {svm_path}")
+        if scores_path:
+            scores_all = torch.load(scores_path, map_location="cpu", weights_only=False)
+            if torch.is_tensor(scores_all):
+                scores_all = scores_all.numpy()
+            print(f"  use_cls scores: {scores_path}")
+
+    def _get_score_val(step: int, layer_idx: int, to_modify: torch.Tensor, branch: str) -> float:
+        if not args.use_cls or models is None:
+            return 1.0
+        layer_key = f"layer_{layer_idx}"
+        ensemble = _ensemble_for_branch(models.get(step, {}).get(layer_key), branch)
+        if not ensemble:
+            return 1.0
+        current_signal = np.ones(len(ensemble), dtype=np.float32)
+        if scores_all is not None:
+            try:
+                current_signal = np.asarray(scores_all[:, step, layer_idx], dtype=np.float32)
+            except Exception:
+                current_signal = np.ones(len(ensemble), dtype=np.float32)
+        mean_act = to_modify.float().mean(dim=tuple(range(to_modify.dim() - 1)))
+        votes = []
+        for i, model in enumerate(ensemble):
+            signal = float(current_signal[i]) if i < len(current_signal) else 1.0
+            if signal <= args.min_signal_threshold:
+                votes.append(1.0)
+                continue
+            votes.append(cls_scale(mean_act, model, args.cls_min, args.task))
+        return float(np.mean(votes)) if votes else 1.0
 
     def _prepare_vec(sv_raw, activations):
         if args.steering_type == "mean":
@@ -171,6 +261,7 @@ def apply_attention_steering(pipe, args, vector):
                     _prepare_vec(sv_txt, txt_hidden),
                     args.strength,
                     args.task,
+                    score_val=_get_score_val(step, layer_idx, txt_hidden, "txt"),
                 )
             if sv_img is not None and args.strength_img != 0:
                 img_new = apply_steering(
@@ -178,6 +269,7 @@ def apply_attention_steering(pipe, args, vector):
                     _prepare_vec(sv_img, img_hidden),
                     args.strength_img,
                     args.task,
+                    score_val=_get_score_val(step, layer_idx, img_hidden, "img"),
                 )
             return (txt_new, img_new)
 
@@ -233,6 +325,9 @@ def parse_args():
     )
     parser.add_argument("--top_k_percent", type=float, default=0.95)
     parser.add_argument("--min_signal_threshold", type=float, default=0.05)
+    parser.add_argument("--use_cls", action="store_true", help="Scale steering by SVM classifier score.")
+    parser.add_argument("--cls_min", type=float, default=20.0)
+    parser.add_argument("--cls_type", type=str, default="tanh")
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--block_steering", type=str, default="all")
     parser.add_argument("--t_steering", type=str, default="all")

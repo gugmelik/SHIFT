@@ -17,6 +17,11 @@ if ! ls "${DATA_DIR}"/*diff.pt >/dev/null 2>&1; then
   ls -la "${DATA_DIR}" || true
   exit 1
 fi
+if ! ls "${DATA_DIR}"/*svm_models.pt >/dev/null 2>&1; then
+  echo "ERROR: no *_svm_models.pt in ${DATA_DIR}. Run scripts/steering_calculate_klein.sh first (SVM step)."
+  ls -la "${DATA_DIR}" || true
+  exit 1
+fi
 echo "Using vectors in ${DATA_DIR}:"
 ls -lh "${DATA_DIR}"/*.pt
 
@@ -31,6 +36,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./src/steering/apply_steering_klein.py \
     --strength_img 0.0 \
     --top_k_percent 0.95 \
     --min_signal_threshold 0.05 \
+    --cls_min 20.0 \
     --injection_point block \
     --results_dir "${RESULTS_DIR}" \
     --inference_steps 4 \
@@ -41,6 +47,7 @@ CUDA_VISIBLE_DEVICES=0 python3 ./src/steering/apply_steering_klein.py \
     --width 1024 \
     --height 1024 \
     --steer_txt \
+    --use_cls \
     --save_origin \
     --prompts_path "${PROMPTS_PATH}"
 

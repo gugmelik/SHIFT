@@ -207,21 +207,27 @@ def register_hooks(pipe, manager: DualStreamHookManager, num_blocks: int) -> Lis
     return handles
 
 
-def run_extraction(pipe, prompts, args, reference_image=None) -> Tuple[Dict, List]:
-    manager = DualStreamHookManager(
-        num_blocks=args.num_layers,
-        save_timesteps=args.save_timesteps,
-        stream=args.token_stream,
-        n_gen_tokens=args.n_gen_tokens,
-    )
-    handles = register_hooks(pipe, manager, args.num_layers)
+def run_extraction(
+    pipe, prompts, args, reference_image=None, collect_activations: bool = True
+) -> Tuple[Dict, List]:
+    manager = None
+    handles: List = []
+    if collect_activations:
+        manager = DualStreamHookManager(
+            num_blocks=args.num_layers,
+            save_timesteps=args.save_timesteps,
+            stream=args.token_stream,
+            n_gen_tokens=args.n_gen_tokens,
+        )
+        handles = register_hooks(pipe, manager, args.num_layers)
     all_images = []
     device = generator_device()
 
     try:
         for i in tqdm(range(0, len(prompts), args.batch_size), desc="Extracting"):
             batch = prompts[i : i + args.batch_size]
-            manager.reset_state()
+            if manager is not None:
+                manager.reset_state()
             generators = [
                 torch.Generator(device).manual_seed(42000 + i * 10 + j)
                 for j in range(len(batch))
@@ -241,6 +247,9 @@ def run_extraction(pipe, prompts, args, reference_image=None) -> Tuple[Dict, Lis
     finally:
         for handle in handles:
             handle.remove()
+
+    if manager is None:
+        return {}, all_images
 
     vectors = manager.aggregate()
     pooled = vectors.get("pooled", {})
@@ -276,6 +285,20 @@ def atomic_torch_save(obj, path: str):
         raise
     size_gb = os.path.getsize(path) / (1024 ** 3)
     print(f"  wrote {path} ({size_gb:.2f} GB)")
+
+
+def sanitize_prompt(prompt: str) -> str:
+    """Match apply_steering_klein.py filenames so eval can pair by index."""
+    return prompt.replace(" ", "_").replace("/", "").replace(",", "")[:50]
+
+
+def save_indexed_images(images, prompts, directory: str, tag: str) -> None:
+    os.makedirs(directory, exist_ok=True)
+    n = min(len(images), len(prompts))
+    for idx in range(n):
+        name = f"{idx:02d}_{sanitize_prompt(prompts[idx])}_{tag}.png"
+        images[idx].save(os.path.join(directory, name))
+    print(f"Saved {n} images to {directory}")
 
 
 def save_grid(images, path: str):
@@ -331,6 +354,11 @@ def parse_args():
     parser.add_argument("--save_timesteps", type=int, default=4)
     parser.add_argument("--save_dir", type=str, default="experiments/klein_9b/style/data_vectors")
     parser.add_argument("--save_image_dir", type=str, default=None)
+    parser.add_argument(
+        "--i2i_only",
+        action="store_true",
+        help="Generate per-prompt I2I teacher images only (no activation dumps).",
+    )
     return parser.parse_args()
 
 
@@ -358,8 +386,26 @@ def main():
         f"timesteps saved: {args.save_timesteps}"
     )
 
-    os.makedirs(args.save_dir, exist_ok=True)
     n_prompts = len(prompts)
+    if args.i2i_only:
+        if not args.save_image_dir:
+            raise ValueError("--i2i_only requires --save_image_dir")
+        os.makedirs(args.save_image_dir, exist_ok=True)
+        print("\nI2I-only: generating teacher images, skipping activation dumps.")
+        _, pos_imgs = run_extraction(
+            pipe, prompts, args, reference_image=reference_image, collect_activations=False
+        )
+        save_indexed_images(
+            pos_imgs,
+            prompts,
+            os.path.join(args.save_image_dir, "i2i"),
+            "i2i",
+        )
+        save_grid(pos_imgs, os.path.join(args.save_image_dir, f"positive_{args.exp_type}_{n_prompts}_grid.png"))
+        print("Done.")
+        return
+
+    os.makedirs(args.save_dir, exist_ok=True)
     file_template = (
         f"{args.exp_type}_gs_{args.gs}_prompts_{n_prompts}_{{}}_block.pt"
     )
@@ -383,6 +429,13 @@ def main():
     print("Saving compact prompt-means (not the full per-sample dump)...")
     atomic_torch_save(pos_vecs, pos_path)
     del pos_vecs
+    if args.save_image_dir:
+        save_indexed_images(
+            pos_imgs,
+            prompts,
+            os.path.join(args.save_image_dir, "i2i"),
+            "i2i",
+        )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

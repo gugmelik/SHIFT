@@ -34,3 +34,5 @@ echo
 echo "Done. Vectors are in ${VECTOR_DIR}"
 echo "Apply with:"
 echo "  bash scripts/apply_steering_klein.sh ${_arg}"
+echo "Then score DINOv2 (after apply, and I2I files in dataset_images/i2i):"
+echo "  bash scripts/eval_dino_klein.sh ${REF_STEM}"

@@ -58,3 +58,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "${PYTHON}" ./src/steering/app
 echo "Check origin vs steered:"
 echo "  ${RESULTS_DIR}/origin"
 echo "  ${RESULTS_DIR}/steered"
+echo "Score DINOv2 with:"
+echo "  bash scripts/eval_dino_klein.sh ${REF_STEM}"

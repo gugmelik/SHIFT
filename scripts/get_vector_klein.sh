@@ -46,4 +46,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "${PYTHON}" ./src/steering/get
 echo "Extracted:"
 echo "  ${POS_PATH}"
 echo "  ${NEG_PATH}"
+echo "  ${SAVE_IMAGE_DIR}/i2i   # per-prompt I2I teacher images"
 echo "Next: bash scripts/steering_calculate_klein.sh ${REF_IMAGE}"

@@ -175,6 +175,16 @@ Useful environment variables:
 | `TRAIN`, `VAL`, `TEST` | prompt files |
 | `MODEL_NAME`, `CUDA_VISIBLE_DEVICES`, `PYTHON` | model id and runtime settings |
 
+**Rerunning is safe.** For each reference image the script checks what is already on disk and skips it:
+- vectors (`ref/vectors`, `text/vectors`); when only the activations exist, it recomputes the vectors without re-extracting;
+- every α, ablation and test folder whose `origin/` and `steered/` already hold one image per prompt;
+- the teacher images;
+- every existing score file.
+
+A half-finished folder resumes from the first missing image. So after a crash, or after adding new
+reference images, just run the same command again. Use `FORCE=1` to redo generation and `FORCE_SCORE=1`
+to recompute scores.
+
 **α selection rule** (fix it before looking at test numbers): on the val set, pick the α with the highest
 style score (CSD, or the Gram distance if CSD is unavailable), subject to:
 - DINOv2 similarity to the unsteered image ≥ 0.85;

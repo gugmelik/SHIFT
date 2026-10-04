@@ -14,6 +14,9 @@
 #   test      final run on the TEST prompts with ALPHA, 3 seeds, + I2I teacher images
 #   score     extended metrics (metrics/eval_klein_extended.py) and Wilcoxon comparison
 #
+# Rerunning is safe: finished work is detected per reference and per run and skipped
+# (vectors, every alpha/ablation/test folder, teacher images, score files). FORCE=1 redoes it.
+#
 # Outputs: experiments/klein_9b/paper/<reference_stem>/...
 # Then: python scripts/collect_paper_results.py  -> paper_results/ (tables, figures, summary)
 # ALPHA must be chosen from the sweep (see the selection rule in the paper, Section 3.4)
@@ -46,6 +49,41 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 count_lines() { grep -c . "$1"; }
 has_stage() { [[ " ${STAGES} " == *" $1 "* ]]; }
 
+# ---- resume support -------------------------------------------------------------
+# Every unit of work (extraction, each apply run, teacher images) is skipped when its
+# outputs are already complete, so rerunning the script never repeats finished work
+# for a reference. Set FORCE=1 to redo everything that the selected STAGES cover.
+n_images() { compgen -G "$1/[0-9]*_*.png" 2>/dev/null | wc -l; }
+images_complete() {  # <dir> <prompt_file>
+  [[ "${FORCE:-0}" != "1" ]] && [[ -d "$1" ]] && (( $(n_images "$1") >= $(count_lines "$2") ))
+}
+vectors_complete() {  # <vector_dir>
+  [[ "${FORCE:-0}" != "1" ]] && compgen -G "$1/*_diff.pt" >/dev/null && compgen -G "$1/*_svm_models.pt" >/dev/null
+}
+activations_complete() {  # <data_vectors_dir>
+  [[ "${FORCE:-0}" != "1" ]] && compgen -G "$1/*_pos_block.pt" >/dev/null && compgen -G "$1/*_neg_block.pt" >/dev/null
+}
+skip() { echo "  skip (done): $*"; }
+
+extract_and_calculate() {  # <tag: ref|text> [extra extract args...]
+  local kind="$1"; shift
+  local base="${EXP}/${kind}"
+  if vectors_complete "${base}/vectors"; then
+    skip "${kind} vectors"
+    return 0
+  fi
+  if activations_complete "${base}/data_vectors"; then
+    skip "${kind} activations (recomputing vectors only)"
+  else
+    local t0; t0=$(date +%s)
+    mkdir -p "${base}"
+    extract "${REF}" "${base}/data_vectors" "${base}/dataset_images" "$@"
+    echo "{\"seconds\": $(( $(date +%s) - t0 )), \"n_prompts\": $(count_lines "${TRAIN}")}" \
+        > "${base}/extract_timing.json"
+  fi
+  calculate "${base}/data_vectors" "${base}/vectors"
+}
+
 extract() {  # <ref_or_empty> <save_dir> <img_dir> [extra args...]
   local ref="$1" save="$2" imgs="$3"; shift 3
   "${PYTHON}" ./src/steering/get_vector_klein.py \
@@ -67,6 +105,11 @@ calculate() {  # <data_vectors_dir> <out_dir>
 
 apply() {  # <vector_dir> <prompts> <results_dir> <stats_json> [extra args...]
   local vec="$1" prompts="$2" out="$3" stats="$4"; shift 4
+  if images_complete "${out}/steered" "${prompts}" && images_complete "${out}/origin" "${prompts}"; then
+    skip "${out}"
+    [[ -f "${stats}" ]] || echo "    note: ${stats} missing (norm/timing stats); use FORCE=1 on this run if you need them"
+    return 0
+  fi
   "${PYTHON}" ./src/steering/apply_steering_klein.py \
       --model_name "${MODEL_NAME}" --data_dir "${vec}" --prompts_path "${prompts}" \
       --task "add concept" --vector_type diff --inference_steps 4 --guidance_scale 1.0 \
@@ -82,10 +125,7 @@ for REF in ${REFS}; do
   echo "=== ${STEM} ==="
 
   if has_stage extract; then
-    T0=$(date +%s)
-    extract "${REF}" "${EXP}/ref/data_vectors" "${EXP}/ref/dataset_images"
-    calculate "${EXP}/ref/data_vectors" "${EXP}/ref/vectors"
-    echo "{\"seconds\": $(( $(date +%s) - T0 )), \"n_prompts\": $(count_lines "${TRAIN}")}" > "${EXP}/ref/extract_timing.json"
+    extract_and_calculate ref
   fi
 
   if has_stage textbase; then
@@ -93,8 +133,7 @@ for REF in ${REFS}; do
     if [[ -z "${TAG}" ]]; then
       echo "  textbase: no style tag for ${STEM} in ${STYLE_TAGS}; skipped"
     else
-      extract "${REF}" "${EXP}/text/data_vectors" "${EXP}/text/dataset_images" --pos_suffix "${TAG}"
-      calculate "${EXP}/text/data_vectors" "${EXP}/text/vectors"
+      extract_and_calculate text --pos_suffix "${TAG}"
     fi
   fi
 
@@ -127,9 +166,13 @@ for REF in ${REFS}; do
             --strength_img "${ALPHA_TEXTBASE:-${ALPHA}}" --steering_type separate --seed "${SEED}"
       fi
     done
-    "${PYTHON}" ./src/steering/get_vector_klein.py --model_name "${MODEL_NAME}" --exp_type style_ref \
-        --prompt_path "${TEST}" --reference_image "${REF}" --height 1024 --width 1024 --gs 1.0 \
-        --num_inference_steps 4 --batch_size 1 --save_image_dir "${EXP}/test/teacher" --i2i_only
+    if images_complete "${EXP}/test/teacher/i2i" "${TEST}"; then
+      skip "${EXP}/test/teacher"
+    else
+      "${PYTHON}" ./src/steering/get_vector_klein.py --model_name "${MODEL_NAME}" --exp_type style_ref \
+          --prompt_path "${TEST}" --reference_image "${REF}" --height 1024 --width 1024 --gs 1.0 \
+          --num_inference_steps 4 --batch_size 1 --save_image_dir "${EXP}/test/teacher" --i2i_only
+    fi
   fi
 
   if has_stage score; then

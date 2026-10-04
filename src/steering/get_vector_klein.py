@@ -18,8 +18,10 @@ The mean-diff calculator only needs these averages.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -242,7 +244,14 @@ def run_extraction(
             )
             if reference_image is not None:
                 call_kwargs["image"] = reference_image
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
             result = pipe(**call_kwargs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            # per-image wall time of this batch (used for the timing table in the paper)
+            args.batch_seconds.extend([(time.perf_counter() - t0) / len(batch)] * len(batch))
             all_images.extend(result.images)
     finally:
         for handle in handles:
@@ -355,6 +364,13 @@ def parse_args():
     parser.add_argument("--save_dir", type=str, default="experiments/klein_9b/style/data_vectors")
     parser.add_argument("--save_image_dir", type=str, default=None)
     parser.add_argument(
+        "--pos_suffix",
+        type=str,
+        default=None,
+        help="Text SHIFT baseline: positive prompts are '<prompt><pos_suffix>' (e.g. ', in cubist style') "
+        "and no reference image is passed; negatives stay prompt-only.",
+    )
+    parser.add_argument(
         "--i2i_only",
         action="store_true",
         help="Generate per-prompt I2I teacher images only (no activation dumps).",
@@ -387,6 +403,7 @@ def main():
     )
 
     n_prompts = len(prompts)
+    args.batch_seconds = []
     if args.i2i_only:
         if not args.save_image_dir:
             raise ValueError("--i2i_only requires --save_image_dir")
@@ -402,6 +419,8 @@ def main():
             "i2i",
         )
         save_grid(pos_imgs, os.path.join(args.save_image_dir, f"positive_{args.exp_type}_{n_prompts}_grid.png"))
+        with open(os.path.join(args.save_image_dir, "i2i_timing.json"), "w", encoding="utf-8") as handle:
+            json.dump({"seconds": args.batch_seconds, "mode": "i2i"}, handle, indent=2)
         print("Done.")
         return
 
@@ -422,8 +441,17 @@ def main():
         "reduced": "prompt_mean",
     }
 
-    print("\nRunning Positive Pass (prompt + reference image)...")
-    pos_vecs, pos_imgs = run_extraction(pipe, prompts, args, reference_image=reference_image)
+    if args.pos_suffix:
+        # Text-only SHIFT baseline on Klein: positive = prompt + style tag, no image.
+        pos_prompts = [f"{p}{args.pos_suffix}" for p in prompts]
+        pos_reference = None
+        metadata["pos_suffix"] = args.pos_suffix
+        print(f"\nRunning Positive Pass (text baseline: prompt + '{args.pos_suffix}', no image)...")
+    else:
+        pos_prompts = prompts
+        pos_reference = reference_image
+        print("\nRunning Positive Pass (prompt + reference image)...")
+    pos_vecs, pos_imgs = run_extraction(pipe, pos_prompts, args, reference_image=pos_reference)
     pos_vecs.update(metadata)
     pos_path = os.path.join(args.save_dir, file_template.format("pos"))
     print("Saving compact prompt-means (not the full per-sample dump)...")

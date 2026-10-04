@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -179,7 +181,10 @@ def apply_steering(
     return (steered_unit * orig_norm).to(dtype)
 
 
-def apply_attention_steering(pipe, args, vector):
+def apply_attention_steering(pipe, args, vector, norm_log=None):
+    """norm_log: optional dict filled with running sums of mean token L2 norms of the
+    *unsteered* block outputs, keyed by "step|layer|stream" (used for the alpha / angle
+    analysis in the paper: theta ~= arctan(alpha / ||h||))."""
     img_vector, txt_vector = split_vector(vector)
     print(f"  Steering branches: img={'YES' if img_vector else 'NO'}, txt={'YES' if txt_vector else 'NO'}")
     if img_vector:
@@ -257,6 +262,12 @@ def apply_attention_steering(pipe, args, vector):
     def steering_hook(layer_idx: int):
         def hook(module, input, output):
             step = state["step"]
+            if norm_log is not None and isinstance(output, tuple) and len(output) == 2:
+                for branch, tensor in (("txt", output[0]), ("img", output[1])):
+                    key = f"{step}|{layer_idx}|{branch}"
+                    mean_norm = float(tensor.detach().float().norm(dim=-1).mean())
+                    total, count = norm_log.get(key, (0.0, 0))
+                    norm_log[key] = (total + mean_norm, count + 1)
             if args.block_steering != "all" and layer_idx not in args.block_steering:
                 return output
             if args.t_steering != "all" and step not in args.t_steering:
@@ -352,6 +363,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--results_dir", type=str, default="experiments/klein_9b/style/generated_images")
     parser.add_argument(
+        "--stats_path",
+        type=str,
+        default=None,
+        help="Write JSON with per-image wall time (origin and steered) and mean token norms "
+        "per (step, block, stream) of unsteered activations.",
+    )
+    parser.add_argument(
         "--save_origin",
         action="store_true",
         help="Also generate unsteered T2I images for visual comparison.",
@@ -407,16 +425,27 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    def _sync():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    stats = {"origin_seconds": [], "steered_seconds": []}
     if args.save_origin:
         for idx, prompt in enumerate(tqdm(prompts, desc="Origin T2I")):
             sanitized = prompt.replace(" ", "_").replace("/", "").replace(",", "")[:50]
             origin_path = os.path.join(origin_dir, f"{idx:02d}_{sanitized}_origin.png")
             if os.path.exists(origin_path):
                 continue
-            generate_one(pipe, prompt, args, device, int(args.seed) + idx).save(origin_path)
+            _sync()
+            t0 = time.perf_counter()
+            image = generate_one(pipe, prompt, args, device, int(args.seed) + idx)
+            _sync()
+            stats["origin_seconds"].append(time.perf_counter() - t0)
+            image.save(origin_path)
         print(f"Saved origin images to {origin_dir}")
 
-    hook_state, remove_hooks = apply_attention_steering(pipe, args, vector)
+    norm_log = {} if args.stats_path else None
+    hook_state, remove_hooks = apply_attention_steering(pipe, args, vector, norm_log=norm_log)
 
     def _on_step_end(_pipe, step_index, _timestep, callback_kwargs):
         hook_state["step"] = step_index + 1
@@ -430,11 +459,33 @@ def main():
             if os.path.exists(out_path):
                 continue
             hook_state["step"] = 0
-            generate_one(
+            _sync()
+            t0 = time.perf_counter()
+            image = generate_one(
                 pipe, prompt, args, device, int(args.seed) + idx, callback=_on_step_end
-            ).save(out_path)
+            )
+            _sync()
+            stats["steered_seconds"].append(time.perf_counter() - t0)
+            image.save(out_path)
     finally:
         remove_hooks()
+
+    if args.stats_path:
+        stats["mean_token_norm"] = {
+            key: total / max(count, 1) for key, (total, count) in sorted(norm_log.items())
+        }
+        stats["config"] = {
+            "strength": args.strength,
+            "strength_img": args.strength_img,
+            "block_steering": args.block_steering,
+            "t_steering": args.t_steering,
+            "steering_type": args.steering_type,
+            "use_cls": args.use_cls,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.stats_path)), exist_ok=True)
+        with open(args.stats_path, "w", encoding="utf-8") as handle:
+            json.dump(stats, handle, indent=2)
+        print(f"Saved stats to {args.stats_path}")
 
     print(f"Saved steered images to {steered_dir}")
     print(

@@ -7,6 +7,15 @@ data/reference_images/*
 !data/reference_images/*.jpeg
 !data/reference_images/*.png
 !data/reference_images/*.webp
+!data/reference_images/*.tsv
+!data/reference_images/open/
+data/reference_images/open/*
+!data/reference_images/open/README.md
+!data/reference_images/open/*.jpg
+!data/reference_images/open/SOURCES.md
+!data/reference_images/open/references.bib
+!data/reference_images/open/sources.json
+!data/reference_images/open/style_tags.tsv
 remove_experiments/
 remove_experiments_flux_schnell/
 style_experiments/
@@ -72,3 +81,5 @@ visualizations.ipynb
 
 
 *.pt
+
+*_tex

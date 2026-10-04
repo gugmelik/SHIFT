@@ -10,6 +10,8 @@
 
 We propose SHIFT, a simple but effective and lightweight framework for concept removal in DiT diffusion models via targeted manipulation of intermediate activations at inference time, inspired by activation steering in large language models. SHIFT learns steering vectors that are dynamically applied to selected layers and timesteps to suppress unwanted visual concepts while preserving the prompt's remaining content and overall image quality. Beyond suppression, the same mechanism can shift generations into a desired style domain or bias samples toward adding or changing target objects.
 
+> **FLUX.2 Klein reference-image style steering** (style from one picture instead of a text tag): see [`KLEIN_STYLE_README.md`](KLEIN_STYLE_README.md) for the method, setup, experiments and evaluation.
+
 Supported backbones: **FLUX.1-schnell / FLUX.1-dev** and **Stable Diffusion 3.5 Medium**.
 
 ## Nudity erase

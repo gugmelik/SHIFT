@@ -105,13 +105,7 @@ flowchart LR
   end
 ```
 
-### 2.5 What this is *not*
 
-- Not IP-Adapter / style LoRA training: no extra weights at extract time; the only learned object is a mean-diff (and optional SVM).
-- Not img2img from the reference latent: apply starts from noise; the reference only influenced the teacher activations used to build the steering vector.
-- Not a prompt rewrite: the apply prompt is the raw subject line, with no “in the style of …” suffix.
-
----
 
 ## 3. Experimental setup
 

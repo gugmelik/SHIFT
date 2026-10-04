@@ -133,31 +133,49 @@ for REF in ${REFS}; do
   fi
 
   if has_stage score; then
+    # Scoring only reads images that already exist; it never generates or steers.
+    # Existing score files are kept (set FORCE_SCORE=1 to recompute them).
     S="${EXP}/scores"; mkdir -p "$S"
+    score() {  # <out_json> <args...>
+      local out="$1"; shift
+      if [[ -f "${out}" && "${FORCE_SCORE:-0}" != "1" ]]; then
+        echo "  keep ${out}"
+        return 0
+      fi
+      "${PYTHON}" metrics/eval_klein_extended.py score --out "${out}" "$@"
+    }
+    has_images() { [[ -d "$1" ]] && compgen -G "$1/[0-9]*_*" >/dev/null; }
+
     # validation runs: alpha sweep and ablations (used for the alpha selection and Table 6)
     for D in "${EXP}"/val/alpha_* "${EXP}"/val/ablation/*; do
-      [[ -d "$D/steered" ]] || continue
-      NAME="val_$(basename "$D")"
-      "${PYTHON}" metrics/eval_klein_extended.py score --gen_dir "$D/steered" --origin_dir "$D/origin" \
-          --reference "${REF}" --prompts "${VAL}" --out "$S/${NAME}.json"
+      has_images "$D/steered" || continue
+      score "$S/val_$(basename "$D").json" --gen_dir "$D/steered" --origin_dir "$D/origin" \
+          --reference "${REF}" --prompts "${VAL}"
     done
+
+    TEACHER="${EXP}/test/teacher/i2i"
+    FID_ARGS=()
+    has_images "${TEACHER}" && FID_ARGS=(--fid_target_dir "${TEACHER}")
     for SEED in ${SEEDS}; do
       for M in ours shift_text; do
         D="${EXP}/test/${M}/seed_${SEED}"
-        [[ -d "$D/steered" ]] || continue
-        "${PYTHON}" metrics/eval_klein_extended.py score --gen_dir "$D/steered" --origin_dir "$D/origin" \
-            --reference "${REF}" --prompts "${TEST}" --fid_target_dir "${EXP}/test/teacher/i2i" \
-            --out "$S/${M}_seed_${SEED}.json"
+        has_images "$D/steered" || continue
+        score "$S/${M}_seed_${SEED}.json" --gen_dir "$D/steered" --origin_dir "$D/origin" \
+            --reference "${REF}" --prompts "${TEST}" "${FID_ARGS[@]}"
       done
-      "${PYTHON}" metrics/eval_klein_extended.py score --gen_dir "${EXP}/test/ours/seed_${SEED}/origin" \
-          --reference "${REF}" --prompts "${TEST}" --fid_target_dir "${EXP}/test/teacher/i2i" \
-          --out "$S/t2i_seed_${SEED}.json"
+      D="${EXP}/test/ours/seed_${SEED}/origin"
+      has_images "$D" && score "$S/t2i_seed_${SEED}.json" --gen_dir "$D" \
+          --reference "${REF}" --prompts "${TEST}" "${FID_ARGS[@]}"
     done
-    "${PYTHON}" metrics/eval_klein_extended.py score --gen_dir "${EXP}/test/teacher/i2i" \
-        --reference "${REF}" --prompts "${TEST}" --out "$S/teacher.json"
-    RUNS=("$S/ours_seed_42.json" "$S/t2i_seed_42.json" "$S/teacher.json")
-    [[ -f "$S/shift_text_seed_42.json" ]] && RUNS+=("$S/shift_text_seed_42.json")
-    "${PYTHON}" metrics/eval_klein_extended.py compare --runs "${RUNS[@]}" --out "$S/compare_seed_42.json"
+    has_images "${TEACHER}" && score "$S/teacher.json" --gen_dir "${TEACHER}" \
+        --reference "${REF}" --prompts "${TEST}"
+
+    if [[ -f "$S/ours_seed_42.json" && -f "$S/t2i_seed_42.json" ]]; then
+      RUNS=("$S/ours_seed_42.json" "$S/t2i_seed_42.json")
+      [[ -f "$S/teacher.json" ]] && RUNS+=("$S/teacher.json")
+      [[ -f "$S/shift_text_seed_42.json" ]] && RUNS+=("$S/shift_text_seed_42.json")
+      "${PYTHON}" metrics/eval_klein_extended.py compare --runs "${RUNS[@]}" --out "$S/compare_seed_42.json"
+    fi
   fi
 done
 

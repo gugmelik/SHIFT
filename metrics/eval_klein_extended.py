@@ -114,6 +114,17 @@ def holm(pvalues: List[float]) -> List[float]:
 
 # ---------------------------------------------------------------------- metrics
 
+def _as_tensor(x) -> torch.Tensor:
+    """Accept a tensor or a transformers ModelOutput (version differences) and return a tensor."""
+    if torch.is_tensor(x):
+        return x
+    for attr in ("image_embeds", "text_embeds", "pooler_output", "last_hidden_state"):
+        value = getattr(x, attr, None)
+        if value is not None:
+            return value[:, 0] if attr == "last_hidden_state" else value
+    raise TypeError(f"Cannot extract a tensor from {type(x).__name__}")
+
+
 class Dinov2:
     name = "dinov2"
 
@@ -159,10 +170,10 @@ class Clip:
     def score(self, img: Image.Image, text: str) -> float:
         inputs = self.processor(text=[text], images=img, return_tensors="pt", padding=True,
                                 truncation=True).to(device)
-        img_f = self.model.get_image_features(pixel_values=inputs["pixel_values"])
-        txt_f = self.model.get_text_features(input_ids=inputs["input_ids"],
-                                             attention_mask=inputs["attention_mask"])
-        return float(F.cosine_similarity(img_f, txt_f).item())
+        # Full forward returns the projected embeddings (image_embeds / text_embeds) in every
+        # transformers version; get_image_features() returns a ModelOutput in transformers>=5.
+        out = self.model(**inputs)
+        return float(F.cosine_similarity(_as_tensor(out.image_embeds), _as_tensor(out.text_embeds)).item())
 
 
 class GramStyle:

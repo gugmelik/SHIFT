@@ -69,8 +69,7 @@ Access and licences:
   page before the first download.
 - **DINOv3** (`facebook/dinov3-vitl16-pretrain-lvd1689m`) is gated on the Hub. Accept its licence, or pass
   `--dinov3_id ""` to skip it.
-- **CSD** (style descriptor, optional): clone <https://github.com/learn2phoenix/CSD>, put it on
-  `PYTHONPATH` and pass `--csd_ckpt path/to/checkpoint.pth`. Without it the CSD column is skipped.
+- **CSD** (content-independent style metric; strongly recommended): see "Setting up CSD" in section 6.
   The VGG Gram distance is always computed and is the fallback style metric.
 
 ---
@@ -217,6 +216,47 @@ python metrics/eval_klein_extended.py compare --runs scores/ours.json scores/t2i
 | DINOv2 cosine, LPIPS, DISTS to the unsteered image | content preservation | [7], [9], [10] |
 | CLIP text–image cosine | prompt alignment | [11] |
 | FID / KID vs teacher set | distribution distance; prefer KID for small sets | [12] |
+
+### Setting up CSD
+
+CSD (Contrastive Style Descriptors; Somepalli et al., ECCV 2024) is a CLIP ViT-L/14 fine-tuned so that
+images in the same artistic style are close, regardless of what they depict. The style score is the
+cosine between the CSD style embeddings of the generated image and of the reference.
+
+```bash
+# 1) code (the model class is not on PyPI)
+git clone https://github.com/learn2phoenix/CSD third_party/CSD
+export PYTHONPATH="$PWD/third_party/CSD:$PWD/third_party/CSD/models:$PYTHONPATH"   # 2nd path = bundled `clip`
+pip install ftfy regex huggingface_hub
+
+# 2) weights (ViT-L, ~2.4 GB) - either source works
+huggingface-cli download tomg-group-umd/CSD-ViT-L pytorch_model.bin --local-dir weights/csd   # HF, CC-BY-4.0
+#    or the Google-Drive checkpoint linked in the CSD README:
+#    https://drive.google.com/file/d/1FX0xs8p-C7Ob-h5Y4cUhTeOepHzXv_46
+```
+
+On first use, `CSD_CLIP` also downloads OpenAI's ViT-L/14 from `openaipublic.azureedge.net` to build the
+backbone; the CSD weights then overwrite it. The loader stops with an error if the checkpoint does not
+contain the backbone and style-head weights, so a wrong file cannot silently produce random scores.
+
+Add CSD to scores that already exist, without regenerating images or recomputing the other metrics:
+
+```bash
+CSD_CKPT=weights/csd/pytorch_model.bin STAGES="score" bash scripts/paper_klein_experiments.sh
+python scripts/collect_paper_results.py --alpha 6
+```
+
+Every existing `scores/*.json` without `csd_to_reference` is updated in place (`--merge`), and the
+Wilcoxon comparison is recomputed. For a single file:
+
+```bash
+python metrics/eval_klein_extended.py score --merge --csd_ckpt weights/csd/pytorch_model.bin \
+    --gen_dir <run>/steered --origin_dir <run>/origin --reference <ref.jpg> --prompts <prompts.txt> \
+    --out <existing.json>
+```
+
+Note: the CSD README states that the released weights give numbers slightly different from those in
+their paper. Use the same weights for every method and report which file you used.
 
 Images are paired by their leading index (`00_…`, `01_…`), so the steered, origin and teacher folders
 must come from the same prompt file.

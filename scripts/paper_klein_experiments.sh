@@ -179,13 +179,21 @@ for REF in ${REFS}; do
     # Scoring only reads images that already exist; it never generates or steers.
     # Existing score files are kept (set FORCE_SCORE=1 to recompute them).
     S="${EXP}/scores"; mkdir -p "$S"
+    # CSD_CKPT: path to the CSD checkpoint or the Hub id tomg-group-umd/CSD-ViT-L (see README, section 6).
+    CSD_ARGS=()
+    [[ -n "${CSD_CKPT:-}" ]] && CSD_ARGS=(--csd_ckpt "${CSD_CKPT}")
     score() {  # <out_json> <args...>
       local out="$1"; shift
       if [[ -f "${out}" && "${FORCE_SCORE:-0}" != "1" ]]; then
-        echo "  keep ${out}"
+        if [[ -n "${CSD_CKPT:-}" ]] && ! grep -q '"csd_to_reference"' "${out}"; then
+          echo "  add CSD to ${out}"
+          "${PYTHON}" metrics/eval_klein_extended.py score --out "${out}" --merge "${CSD_ARGS[@]}" "$@"
+        else
+          echo "  keep ${out}"
+        fi
         return 0
       fi
-      "${PYTHON}" metrics/eval_klein_extended.py score --out "${out}" "$@"
+      "${PYTHON}" metrics/eval_klein_extended.py score --out "${out}" "${CSD_ARGS[@]}" "$@"
     }
     has_images() { [[ -d "$1" ]] && compgen -G "$1/[0-9]*_*" >/dev/null; }
 

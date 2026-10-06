@@ -205,16 +205,47 @@ class GramStyle:
 
 
 class Csd:
-    """CSD style descriptor (Somepalli et al., 2024). Requires https://github.com/learn2phoenix/CSD
-    on PYTHONPATH and its checkpoint. Adjust the import if the repository layout changes."""
+    """CSD style descriptor (Somepalli et al., ECCV 2024, arXiv:2404.01292).
+
+    Setup (once):
+      git clone https://github.com/learn2phoenix/CSD third_party/CSD
+      export PYTHONPATH="$PWD/third_party/CSD:$PWD/third_party/CSD/models:$PYTHONPATH"
+    The second entry makes the repository's bundled `clip` package importable
+    (alternatively: pip install git+https://github.com/openai/CLIP.git).
+
+    `ckpt` may be
+      * the Google-Drive checkpoint from the CSD README (dict with "model_state_dict"),
+      * the Hugging Face file tomg-group-umd/CSD-ViT-L/pytorch_model.bin (plain state dict),
+      * or the Hub repo id "tomg-group-umd/CSD-ViT-L" (downloaded via huggingface_hub).
+    The style embedding is the L2-normalised `style_output` of CSD_CLIP("vit_large"),
+    computed on a 224 px bicubic resize + centre crop with CLIP normalisation, as in the
+    repository's evaluation transform (CSD/loss_utils.py: transforms_branch0).
+    """
 
     def __init__(self, ckpt: str):
         from CSD.model import CSD_CLIP  # type: ignore
         from CSD.utils import convert_state_dict  # type: ignore
 
+        path = ckpt
+        if not Path(ckpt).exists() and "/" in ckpt:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(ckpt, "pytorch_model.bin")
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        state = convert_state_dict(state)
+
         self.model = CSD_CLIP("vit_large", "default")
-        state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        self.model.load_state_dict(convert_state_dict(state["model_state_dict"]), strict=False)
+        result = self.model.load_state_dict(state, strict=False)
+        # strict=False is needed for auxiliary keys, but the style head and backbone must load.
+        critical = [k for k in result.missing_keys if k.startswith(("backbone", "last_layer_style"))]
+        if critical:
+            raise RuntimeError(f"CSD checkpoint is missing {len(critical)} backbone/style keys, "
+                               f"e.g. {critical[:3]} - wrong file?")
+        if result.missing_keys or result.unexpected_keys:
+            print(f"CSD: missing {len(result.missing_keys)} / unexpected {len(result.unexpected_keys)} "
+                  "non-critical keys (ignored)")
         self.model = self.model.to(device).eval()
         self.tf = T.Compose([
             T.Resize(224, interpolation=T.InterpolationMode.BICUBIC), T.CenterCrop(224), T.ToTensor(),
@@ -224,7 +255,7 @@ class Csd:
     @torch.no_grad()
     def embed(self, img: Image.Image) -> torch.Tensor:
         _, _, style = self.model(self.tf(img).unsqueeze(0).to(device))
-        style = style.flatten()
+        style = style.flatten().float()
         return style / style.norm()
 
 
@@ -250,13 +281,30 @@ def cmd_score(args) -> None:
         sys.exit(f"No indexed images in {args.gen_dir}")
     ref_img = load_rgb(Path(args.reference)) if args.reference else None
 
-    dinov2 = try_build(Dinov2, "DINOv2")
-    dinov3 = try_build(lambda: Dinov3(args.dinov3_id), "DINOv3") if args.dinov3_id else None
-    clip = try_build(lambda: Clip(args.clip_id), "CLIP") if prompts else None
-    gram = try_build(GramStyle, "Gram/VGG-19") if ref_img is not None else None
-    csd = try_build(lambda: Csd(args.csd_ckpt), "CSD") if args.csd_ckpt and ref_img is not None else None
-    lpips_fn = try_build(lambda: __import__("lpips").LPIPS(net="alex").to(device), "LPIPS") if origin else None
-    dists_fn = try_build(lambda: __import__("piq").DISTS().to(device), "DISTS") if origin else None
+    # --merge: keep everything already stored in --out and compute only the missing metrics
+    previous = {}
+    if args.merge and Path(args.out).is_file():
+        previous = json.load(open(args.out, encoding="utf-8"))
+    done = {m for m, vals in previous.get("per_image", {}).items()
+            if set(vals) >= {str(i) for i in gen}}
+
+    def need(*metrics: str) -> bool:
+        return any(m not in done for m in metrics)
+
+    dinov2 = try_build(Dinov2, "DINOv2") if need("dinov2_to_reference", "dinov2_to_origin") else None
+    dinov3 = (try_build(lambda: Dinov3(args.dinov3_id), "DINOv3")
+              if args.dinov3_id and ref_img is not None and need("dinov3_to_reference") else None)
+    clip = try_build(lambda: Clip(args.clip_id), "CLIP") if prompts and need("clip_text") else None
+    gram = (try_build(GramStyle, "Gram/VGG-19")
+            if ref_img is not None and need("gram_to_reference") else None)
+    csd = (try_build(lambda: Csd(args.csd_ckpt), "CSD")
+           if args.csd_ckpt and ref_img is not None and need("csd_to_reference") else None)
+    lpips_fn = (try_build(lambda: __import__("lpips").LPIPS(net="alex").to(device), "LPIPS")
+                if origin and need("lpips_to_origin") else None)
+    dists_fn = (try_build(lambda: __import__("piq").DISTS().to(device), "DISTS")
+                if origin and need("dists_to_origin") else None)
+    if args.csd_ckpt and csd is None and need("csd_to_reference") and ref_img is not None:
+        sys.exit("CSD was requested (--csd_ckpt) but could not be loaded; see the warning above.")
 
     ref_cache = {}
     if ref_img is not None:
@@ -265,7 +313,8 @@ def cmd_score(args) -> None:
         if gram: ref_cache["gram"] = gram.grams(ref_img)
         if csd: ref_cache["csd"] = csd.embed(ref_img)
 
-    per_image: Dict[str, Dict[int, float]] = {}
+    per_image: Dict[str, Dict[int, float]] = {
+        m: {int(k): v for k, v in vals.items()} for m, vals in previous.get("per_image", {}).items()}
 
     def put(metric: str, idx: int, value: float):
         per_image.setdefault(metric, {})[idx] = float(value)
@@ -296,8 +345,8 @@ def cmd_score(args) -> None:
 
     summary = {metric: bootstrap_ci(list(vals.values()), args.n_boot) for metric, vals in per_image.items()}
 
-    set_level = {}
-    if args.fid_target_dir:
+    set_level = previous.get("set_level", {})
+    if args.fid_target_dir and not set_level:
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
             from torchmetrics.image.kid import KernelInceptionDistance
@@ -332,7 +381,7 @@ def cmd_score(args) -> None:
         ci = stats["ci95"]
         print(f"{metric:<22} {stats['mean']:>9.4f}  [{ci[0]:.4f}, {ci[1]:.4f}]  n={stats['n']}")
     if set_level:
-        print(f"FID {set_level['fid']:.2f}  KID {set_level['kid_mean']:.4f}±{set_level['kid_std']:.4f}")
+        print("  ".join(f"{k} {v:.4f}" for k, v in set_level.items() if isinstance(v, (int, float))))
     print(f"saved {args.out}")
 
 
@@ -389,6 +438,8 @@ def main():
     s.add_argument("--clip_id", default="openai/clip-vit-large-patch14")
     s.add_argument("--csd_ckpt", default=None)
     s.add_argument("--n_boot", type=int, default=10000)
+    s.add_argument("--merge", action="store_true",
+                   help="If --out exists, keep its metrics and compute only the missing ones (e.g. add CSD)")
     s.add_argument("--out", required=True)
 
     c = sub.add_parser("compare")

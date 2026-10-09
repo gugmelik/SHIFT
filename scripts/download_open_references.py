@@ -77,10 +77,13 @@ REFERENCES = {
                                 ", as an impressionist painting by Claude Monet"),
     "vangogh_self_portrait":   (80607, "post-impressionism, impasto brushwork",
                                 ", in the style of Vincent van Gogh with thick visible brushstrokes"),
-    "ciurlionis_sonata_sun":   (dict(query="Čiurlionis Sonata of the Sun Allegro", artist="ciurlion"),
+    "ciurlionis_sonata_sun":   (dict(queries=["Čiurlionis Sonata of the Sun Allegro", "Čiurlionis Saulės sonata",
+                                      "Ciurlionis sonata sun", "Čiurlionis sonata", "Čiurlionis painting"],
+                                     artist="ciurlion"),
                                 "symbolism, tempera on paper (little-known)",
                                 ", as a symbolist tempera painting by Mikalojus Konstantinas Ciurlionis"),
-    "pirosmani_giraffe":       (dict(query="Pirosmani Giraffe", artist="pirosman"),
+    "pirosmani_giraffe":       (dict(queries=["Pirosmani Giraffe", "Niko Pirosmani giraffe", "Pirosmani painting"],
+                                     artist="pirosman"),
                                 "naive painting on oilcloth (little-known)",
                                 ", as a naive painting on black oilcloth by Niko Pirosmani"),
 }
@@ -132,33 +135,50 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
 
-def commons_lookup(spec: dict, width: int, exact_file: str = None) -> dict:
-    """Find a public-domain bitmap on Wikimedia Commons: the first search hit whose licence is public
-    domain and whose Artist field contains spec['artist']. --commons_file pins an exact file."""
+def commons_lookup(spec: dict, width: int, exact_file: str = None, verbose: bool = False) -> dict:
+    """Find a public-domain bitmap on Wikimedia Commons. Tries every query in spec['queries'] (or
+    spec['query']); accepts the first hit whose licence is public domain and whose Artist field *or*
+    file name contains spec['artist'] (accent-insensitive). --commons_file pins an exact file.
+    If nothing matches, the candidates and the reason each was rejected are printed."""
     import urllib.parse
-    common = {"action": "query", "format": "json", "prop": "imageinfo",
-              "iiprop": "url|size|mime|extmetadata", "iiurlwidth": str(width)}
+    base = {"action": "query", "format": "json", "prop": "imageinfo",
+            "iiprop": "url|size|mime|extmetadata", "iiurlwidth": str(width)}
     if exact_file:
-        common["titles"] = exact_file if exact_file.startswith("File:") else f"File:{exact_file}"
+        title = exact_file if exact_file.startswith("File:") else f"File:{exact_file}"
+        requests = [dict(base, titles=title)]
     else:
-        common.update(generator="search", gsrnamespace="6", gsrlimit="20",
-                      gsrsearch=f"{spec['query']} filetype:bitmap")
-    pages = get_json(f"{COMMONS_API}?{urllib.parse.urlencode(common)}").get("query", {}).get("pages", {})
-    for page in sorted(pages.values(), key=lambda p: p.get("index", 0)):
-        info = (page.get("imageinfo") or [{}])[0]
-        meta = {k: v.get("value") for k, v in info.get("extmetadata", {}).items()}
-        licence = _ascii(meta.get("LicenseShortName", "") + " " + meta.get("License", ""))
-        artist = _ascii(_strip_html(meta.get("Artist", "")))
-        ok_lic = "public domain" in licence or licence.startswith("pd") or " pd" in licence
-        if not (ok_lic and spec["artist"] in artist and info.get("mime") in ("image/jpeg", "image/png")
-                and info.get("width", 0) >= 600):
-            continue
-        return {"file_title": page["title"], "image_url": info.get("thumburl") or info["url"],
-                "page_url": info.get("descriptionurl"), "title": _strip_html(meta.get("ObjectName", "")) or page["title"],
-                "artist": _strip_html(meta.get("Artist", "")), "date": _strip_html(meta.get("DateTimeOriginal", "")),
-                "credit": _strip_html(meta.get("Credit", "")), "license_short": meta.get("LicenseShortName", ""),
-                "license_url": meta.get("LicenseUrl") or "https://commons.wikimedia.org/wiki/Commons:Licensing"}
-    raise RuntimeError(f"no public-domain Commons image matched {spec} (pin one with --commons_file)")
+        queries = spec.get("queries") or [spec["query"]]
+        requests = [dict(base, generator="search", gsrnamespace="6", gsrlimit="30", gsrsearch=q)
+                    for q in queries]
+    rejected = []
+    for req in requests:
+        pages = get_json(f"{COMMONS_API}?{urllib.parse.urlencode(req)}").get("query", {}).get("pages", {})
+        for page in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+            info = (page.get("imageinfo") or [{}])[0]
+            meta = {k: v.get("value") for k, v in info.get("extmetadata", {}).items()}
+            licence = _ascii(_strip_html(f"{meta.get('LicenseShortName', '')} {meta.get('License', '')} "
+                                         f"{meta.get('UsageTerms', '')}"))
+            artist = _ascii(_strip_html(meta.get("Artist", "")))
+            fname = _ascii(page.get("title", ""))
+            ok_lic = ("public domain" in licence or licence.startswith("pd") or " pd" in licence
+                      or "cc0" in licence)
+            ok_artist = exact_file is not None or spec["artist"] in artist or spec["artist"] in fname
+            ok_img = info.get("mime") in ("image/jpeg", "image/png", "image/tiff") and info.get("width", 0) >= 600
+            if ok_lic and ok_artist and ok_img:
+                return {"file_title": page["title"], "image_url": info.get("thumburl") or info["url"],
+                        "page_url": info.get("descriptionurl"),
+                        "title": _strip_html(meta.get("ObjectName", "")) or page["title"][5:].rsplit(".", 1)[0],
+                        "artist": _strip_html(meta.get("Artist", "")) or spec["artist"],
+                        "date": _strip_html(meta.get("DateTimeOriginal", "")),
+                        "credit": _strip_html(meta.get("Credit", "")),
+                        "license_short": meta.get("LicenseShortName", ""),
+                        "license_url": meta.get("LicenseUrl") or "https://commons.wikimedia.org/wiki/Commons:Licensing"}
+            why = [w for w, ok in (("licence", ok_lic), ("artist", ok_artist), ("mime/size", ok_img)) if not ok]
+            rejected.append(f"  {page.get('title')}  [{info.get('mime')}, {info.get('width')}px, "
+                            f"licence='{licence[:40]}', artist='{artist[:40]}'] rejected: {', '.join(why)}")
+    print("Commons candidates:\n" + ("\n".join(rejected[:25]) or "  (search returned nothing)"), file=sys.stderr)
+    raise RuntimeError(f"no public-domain Commons image matched {spec['artist']}; pin one with "
+                       f"--commons_file <slug>=File:<name> (see candidates above)")
 
 
 def bibtex_key(slug: str) -> str:

@@ -296,12 +296,16 @@ def apply_attention_steering(pipe, args, vector, norm_log=None):
             votes.append(cls_scale(mean_act, model, args.cls_min, args.task))
         return float(np.mean(votes)) if votes else 1.0
 
+    gpu_cache = {}
+
     def _prepare_vec(sv_raw, activations):
-        if args.steering_type == "mean":
-            steering_vec = sv_raw.mean(0, keepdim=True)
-        else:
-            steering_vec = sv_raw
-        return steering_vec.to(activations.device, activations.dtype)
+        # Moved to the GPU once per (tensor, device, dtype) and reused for every image: the
+        # per-call CPU->GPU copy of the per-token field dominated the measured steering overhead.
+        key = (id(sv_raw), activations.device, activations.dtype, args.steering_type)
+        if key not in gpu_cache:
+            steering_vec = sv_raw.mean(0, keepdim=True) if args.steering_type == "mean" else sv_raw
+            gpu_cache[key] = steering_vec.to(activations.device, activations.dtype)
+        return gpu_cache[key]
 
     def _get_layer_vectors(step: int, layer_idx: int):
         layer_key = f"layer_{layer_idx}"
@@ -421,6 +425,8 @@ def parse_args():
         help="Write JSON with per-image wall time (origin and steered) and mean token norms "
         "per (step, block, stream) of unsteered activations.",
     )
+    parser.add_argument("--log_norms", action="store_true",
+                        help="Record mean token norms per (step, block, stream) into --stats_path (slower)")
     parser.add_argument(
         "--save_origin",
         action="store_true",
@@ -499,7 +505,9 @@ def main():
             image.save(origin_path)
         print(f"Saved origin images to {origin_dir}")
 
-    norm_log = {} if args.stats_path else None
+    # Token-norm logging forces a GPU sync per hook call; it is only enabled with --log_norms
+    # (alpha sweep, Table 1) so that the timed test runs measure the steering itself.
+    norm_log = {} if (args.stats_path and args.log_norms) else None
     hook_state, remove_hooks = apply_attention_steering(pipe, args, vector, norm_log=norm_log)
 
     def _on_step_end(_pipe, step_index, _timestep, callback_kwargs):
@@ -526,9 +534,10 @@ def main():
         remove_hooks()
 
     if args.stats_path:
-        stats["mean_token_norm"] = {
-            key: total / max(count, 1) for key, (total, count) in sorted(norm_log.items())
-        }
+        if norm_log is not None:
+            stats["mean_token_norm"] = {
+                key: total / max(count, 1) for key, (total, count) in sorted(norm_log.items())
+            }
         stats["config"] = {
             "strength": args.strength,
             "strength_img": args.strength_img,

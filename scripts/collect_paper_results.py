@@ -271,6 +271,12 @@ def main() -> None:
         for k in ("t2i", "steered", "i2i"):
             md.append(f"- {k}: " + (f"{t[k]['mean']:.3f} ± {t[k]['std']:.3f} (n={t[k]['n']})" if t[k] else "—"))
         md.append(f"- extraction total: {t['extraction_total'] if t['extraction_total'] else '—'} s")
+        if t["steered"] and t["i2i"]:
+            r = t["steered"]["mean"] / t["i2i"]["mean"]
+            n_runs = t["extraction_total"] / max(t["i2i"]["mean"] - t["steered"]["mean"], 1e-9) \
+                if t["extraction_total"] and t["i2i"]["mean"] > t["steered"]["mean"] else None
+            md.append(f"- **steered / teacher (I2I) = {r:.2f}** (steering is {100 * (1 - r):+.0f}% faster than "
+                      f"feeding the reference)" + (f"; extraction pays off after ~{n_runs:.0f} images" if n_runs else ""))
         if e.get("wilcoxon"):
             md += ["", "**Wilcoxon (seed 42, Holm), ours vs others**", "",
                    "| other | metric | mean diff | p_holm |", "|---|---|---|---|"]

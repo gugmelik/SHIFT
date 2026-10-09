@@ -177,7 +177,7 @@ for REF in ${REFS}; do
       [[ -n "${FIRST_A}" ]] && reuse_origin "${EXP}/val/alpha_${FIRST_A}" "${EXP}/val/alpha_${A}"
       [[ -z "${FIRST_A}" ]] && FIRST_A="${A}"
       apply "${EXP}/ref/vectors" "${VAL}" "${EXP}/val/alpha_${A}" "${EXP}/val/alpha_${A}/stats.json" \
-          --strength_img "${A}" --steering_type separate --seed 42
+          --strength_img "${A}" --steering_type separate --seed 42 --log_norms
     done
   fi
 

@@ -267,16 +267,12 @@ def main() -> None:
             md.append(f"| {g} | {v['img'] if v['img'] is None else round(v['img'], 2)} | "
                       f"{v['txt'] if v['txt'] is None else round(v['txt'], 2)} |")
         t = e["timing"]
-        md += ["", "**Table 2: timing (s/image)**", ""]
-        for k in ("t2i", "steered", "i2i"):
-            md.append(f"- {k}: " + (f"{t[k]['mean']:.3f} ± {t[k]['std']:.3f} (n={t[k]['n']})" if t[k] else "—"))
-        md.append(f"- extraction total: {t['extraction_total'] if t['extraction_total'] else '—'} s")
+        md += ["", "**Table 2: generation time, steering vs teacher with the reference (s/image)**", ""]
+        for k, label in (("steered", "ours (steering, no reference)"), ("i2i", "teacher (reference fed, I2I)")):
+            md.append(f"- {label}: " + (f"{t[k]['mean']:.3f} ± {t[k]['std']:.3f} (n={t[k]['n']})" if t[k] else "—"))
         if t["steered"] and t["i2i"]:
             r = t["steered"]["mean"] / t["i2i"]["mean"]
-            n_runs = t["extraction_total"] / max(t["i2i"]["mean"] - t["steered"]["mean"], 1e-9) \
-                if t["extraction_total"] and t["i2i"]["mean"] > t["steered"]["mean"] else None
-            md.append(f"- **steered / teacher (I2I) = {r:.2f}** (steering is {100 * (1 - r):+.0f}% faster than "
-                      f"feeding the reference)" + (f"; extraction pays off after ~{n_runs:.0f} images" if n_runs else ""))
+            md.append(f"- **ours / teacher = {r:.2f}** ({100 * (1 - r):+.0f}% vs teacher)")
         if e.get("wilcoxon"):
             md += ["", "**Wilcoxon (seed 42, Holm), ours vs others**", "",
                    "| other | metric | mean diff | p_holm |", "|---|---|---|---|"]

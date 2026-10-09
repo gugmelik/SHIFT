@@ -30,8 +30,11 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 INDEX_RE = re.compile(r"^(\d+)_")
-METHOD_ORDER = ["t2i", "shift_text", "teacher", "ours"]
-METHOD_LABEL = {"t2i": "T2I", "shift_text": "SHIFT (text)", "teacher": "Teacher (I2I)", "ours": "Ours"}
+METHOD_ORDER = ["t2i", "shift_text", "teacher", "ours", "ours_rule", "act", "casteer", "ipadapter"]
+METHOD_LABEL = {"t2i": "T2I", "shift_text": "SHIFT (text)", "teacher": "Teacher (I2I)", "ours": "Ours",
+                "ours_rule": "Ours (rule alpha)", "act": "Linear-AcT (Klein)",
+                "casteer": "CASteer (SDXL)", "ipadapter": "IP-Adapter (FLUX.1-dev)"}
+SCALE = {"gram_to_reference": 1e5}  # Gram distances are printed x1e5, as in the paper
 MAIN_METRICS = ["csd_to_reference", "gram_to_reference", "dinov2_to_reference", "dinov3_to_reference",
                 "dinov2_to_origin", "lpips_to_origin", "dists_to_origin", "clip_text"]
 BLOCK_GROUPS = [(0, 1), (2, 3), (4, 5), (6, 7)]
@@ -70,13 +73,13 @@ def pooled_metrics(score_files: List[Path]) -> Dict[str, Dict]:
     return out
 
 
-def fmt(stat: Optional[Dict], digits: int = 3) -> str:
+def fmt(stat: Optional[Dict], digits: int = 3, k: float = 1.0) -> str:
     if not stat:
         return "—"
     if stat.get("ci95"):
         lo, hi = stat["ci95"]
-        return f"{stat['mean']:.{digits}f} [{lo:.{digits}f}, {hi:.{digits}f}]"
-    return f"{stat['mean']:.{digits}f}"
+        return f"{stat['mean'] * k:.{digits}f} [{lo * k:.{digits}f}, {hi * k:.{digits}f}]"
+    return f"{stat['mean'] * k:.{digits}f}"
 
 
 def map_by_index(directory: Path) -> Dict[int, Path]:
@@ -142,14 +145,18 @@ def main() -> None:
         # --- Table 5: method comparison on the test set (pooled over seeds)
         methods = {}
         for m in METHOD_ORDER:
-            files = [S / "teacher.json"] if m == "teacher" else sorted(S.glob(f"{m}_seed_*.json"))
+            files = sorted(S.glob(f"{m}_seed_*.json"))
+            if m == "teacher" and not files:  # old unpaired teacher (no content metrics)
+                files = [S / "teacher.json"]
             files = [f for f in files if f.is_file()]
             if files:
                 methods[m] = pooled_metrics(files)
-            elif m != "shift_text":
+            elif m not in ("shift_text", "ours_rule", "act", "casteer", "ipadapter"):
                 missing.append(f"{S}/{m}{'' if m == 'teacher' else '_seed_*'}.json")
         entry["test"] = methods
         entry["wilcoxon"] = load(S / "compare_seed_42.json")
+        rule = ref / "rule_alpha.txt"
+        entry["rule_alpha"] = float(rule.read_text().strip()) if rule.is_file() else None
 
         # --- alpha sweep and ablations (validation set)
         entry["val_sweep"] = {}
@@ -157,7 +164,10 @@ def main() -> None:
             alpha = f.stem.replace("val_alpha_", "")
             entry["val_sweep"][alpha] = pooled_metrics([f])
         entry["val_ablation"] = {f.stem.replace("val_", ""): pooled_metrics([f])
-                                 for f in sorted(S.glob("val_*.json")) if not f.stem.startswith("val_alpha_")}
+                                 for f in sorted(S.glob("val_*.json"))
+                                 if not f.stem.startswith(("val_alpha_", "val_act_", "val_casteer_", "val_ipadapter_", "val_blk_", "val_t2i", "val_nameprobe"))}
+        entry["baseline_sweeps"] = {m: {f.stem[len(f"val_{m}_"):]: pooled_metrics([f]) for f in sorted(S.glob(f"val_{m}_*.json"))}
+                                    for m in ("act", "casteer", "ipadapter")}
         if not entry["val_sweep"]:
             missing.append(f"{S}/val_alpha_*.json")
 
@@ -182,7 +192,9 @@ def main() -> None:
             st = load(stats_file) or {}
             origin_t += st.get("origin_seconds", [])
             steered_t += st.get("steered_seconds", [])
-        i2i_t = (load(ref / "test/teacher/i2i_timing.json") or {}).get("seconds", [])
+        i2i_t = []
+        for tf in [ref / "test/teacher/i2i_timing.json", *sorted(ref.glob("test/teacher/seed_*/i2i_timing.json"))]:
+            i2i_t += (load(tf) or {}).get("seconds", [])
         extract = (load(ref / "ref/extract_timing.json") or {}).get("seconds")
 
         def mean_std(xs):
@@ -196,7 +208,8 @@ def main() -> None:
         if seed_dirs:
             sd = seed_dirs[0]
             origin, steered = map_by_index(sd / "origin"), map_by_index(sd / "steered")
-            teacher = map_by_index(ref / "test/teacher/i2i")
+            paired_t = ref / "test/teacher" / sd.name / "i2i"   # same seed as the origin column
+            teacher = map_by_index(paired_t if paired_t.is_dir() else ref / "test/teacher/i2i")
             rows = [[origin.get(i), steered.get(i), teacher.get(i)] for i in args.fig_indices if i in origin]
             if rows:
                 grid(rows, ["T2I", f"ours (alpha={args.alpha})", "teacher I2I"]).save(
@@ -227,18 +240,28 @@ def main() -> None:
                "| Method | " + " | ".join(MAIN_METRICS) + " | FID | KID |",
                "|---" * (len(MAIN_METRICS) + 3) + "|"]
         for m, stats in e["test"].items():
-            md.append(f"| {METHOD_LABEL[m]} | " + " | ".join(fmt(stats.get(k)) for k in MAIN_METRICS)
+            md.append(f"| {METHOD_LABEL[m]} | " + " | ".join(fmt(stats.get(k), 3, SCALE.get(k, 1)) for k in MAIN_METRICS)
                       + f" | {fmt(stats.get('fid'), 2)} | {fmt(stats.get('kid_mean'), 4)} |")
-        md += ["", "**Alpha sweep (val)**", "", "| alpha | csd | gram | dinov2_to_origin | clip_text |",
+        if e.get("rule_alpha") is not None:
+            md += ["", f"Rule-selected alpha (scripts/select_alpha.py): {e['rule_alpha']:g}"]
+        md += ["", "**Alpha sweep (val; gram x1e5)**", "", "| alpha | csd | gram | dinov2_to_origin | clip_text |",
                "|---|---|---|---|---|"]
         for a, st in sorted(e["val_sweep"].items(), key=lambda kv: float(kv[0])):
-            md.append(f"| {a} | {fmt(st.get('csd_to_reference'))} | {fmt(st.get('gram_to_reference'), 5)} | "
+            md.append(f"| {a} | {fmt(st.get('csd_to_reference'))} | {fmt(st.get('gram_to_reference'), 3, 1e5)} | "
                       f"{fmt(st.get('dinov2_to_origin'))} | {fmt(st.get('clip_text'))} |")
-        md += ["", "**Table 6: ablations (val)**", "", "| config | csd | dinov2_to_origin | clip_text |",
-               "|---|---|---|---|"]
-        for name, st in e["val_ablation"].items():
-            md.append(f"| {name} | {fmt(st.get('csd_to_reference'))} | {fmt(st.get('dinov2_to_origin'))} | "
-                      f"{fmt(st.get('clip_text'))} |")
+        md += ["", "**Table 6: ablations (val; main = alpha sweep at the test alpha)**", "",
+               "| config | " + " | ".join(MAIN_METRICS) + " |", "|---" * (len(MAIN_METRICS) + 1) + "|"]
+        main_key = str(int(args.alpha)) if args.alpha is not None and float(args.alpha).is_integer() else str(args.alpha)
+        rows6 = ([("main (alpha sweep)", e["val_sweep"][main_key])] if main_key in e["val_sweep"] else []) \
+            + list(e["val_ablation"].items())
+        for name, st in rows6:
+            md.append(f"| {name} | " + " | ".join(fmt(st.get(k), 3, SCALE.get(k, 1)) for k in MAIN_METRICS) + " |")
+        for bm, sweep in (e.get("baseline_sweeps") or {}).items():
+            if sweep:
+                md += ["", f"**Baseline sweep (val): {METHOD_LABEL[bm]}**", "",
+                       "| strength | " + " | ".join(MAIN_METRICS) + " |", "|---" * (len(MAIN_METRICS) + 1) + "|"]
+                for x, st in sorted(sweep.items(), key=lambda kv: float(kv[0])):
+                    md.append(f"| {x} | " + " | ".join(fmt(st.get(k), 3, SCALE.get(k, 1)) for k in MAIN_METRICS) + " |")
         md += ["", "**Table 1: mean token norm**", "", "| blocks | img | txt |", "|---|---|---|"]
         for g, v in e["token_norms"].items():
             md.append(f"| {g} | {v['img'] if v['img'] is None else round(v['img'], 2)} | "

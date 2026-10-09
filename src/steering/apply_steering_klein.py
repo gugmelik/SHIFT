@@ -181,7 +181,57 @@ def apply_steering(
     return (steered_unit * orig_norm).to(dtype)
 
 
+def apply_act_steering(pipe, args, norm_log=None):
+    """Linear-AcT baseline: h' = (1 - lam) h + lam (omega * h + beta) per unit, on every token of
+    the stream; lam = --strength_img (image stream) and --strength (text stream).
+    Maps from src/steering/calculate_act_maps.py. No renormalisation (as in AcT)."""
+    maps = torch.load(args.act_path, map_location="cpu", weights_only=False)["maps"]
+    state = {"step": 0}
+    cache = {}
+
+    def _map(step, layer_idx, branch, ref):
+        key = (step, layer_idx, branch)
+        if key not in cache:
+            m = maps.get(step, {}).get(f"layer_{layer_idx}", {}).get(branch)
+            cache[key] = None if m is None else (m["omega"].to(ref.device, torch.float32),
+                                                 m["beta"].to(ref.device, torch.float32))
+        return cache[key]
+
+    def _transport(h, m, lam):
+        if m is None or lam == 0:
+            return h
+        omega, beta = m
+        hf = h.float()
+        return ((1 - lam) * hf + lam * (hf * omega + beta)).to(h.dtype)
+
+    def hook_for(layer_idx):
+        def hook(module, input, output):
+            step = state["step"]
+            if not (isinstance(output, tuple) and len(output) == 2):
+                return output
+            if norm_log is not None:
+                for branch, tensor in (("txt", output[0]), ("img", output[1])):
+                    key = f"{step}|{layer_idx}|{branch}"
+                    total, count = norm_log.get(key, (0.0, 0))
+                    norm_log[key] = (total + float(tensor.detach().float().norm(dim=-1).mean()), count + 1)
+            if args.block_steering != "all" and layer_idx not in args.block_steering:
+                return output
+            if args.t_steering != "all" and step not in args.t_steering:
+                return output
+            txt, img = output
+            return (_transport(txt, _map(step, layer_idx, "txt", txt), args.strength),
+                    _transport(img, _map(step, layer_idx, "img", img), args.strength_img))
+        return hook
+
+    blocks = pipe.transformer.transformer_blocks
+    handles = [blocks[i].register_forward_hook(hook_for(i)) for i in range(min(args.num_layers, len(blocks)))]
+    print(f"  Linear-AcT maps: {args.act_path} (lam_img={args.strength_img}, lam_txt={args.strength})")
+    return state, lambda: [h.remove() for h in handles]
+
+
 def apply_attention_steering(pipe, args, vector, norm_log=None):
+    if getattr(args, "act_path", None):
+        return apply_act_steering(pipe, args, norm_log=norm_log)
     """norm_log: optional dict filled with running sums of mean token L2 norms of the
     *unsteered* block outputs, keyed by "step|layer|stream" (used for the alpha / angle
     analysis in the paper: theta ~= arctan(alpha / ||h||))."""
@@ -319,6 +369,8 @@ def parse_args():
         default="black-forest-labs/FLUX.2-klein-9B",
     )
     parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--act_path", type=str, default=None,
+                        help="Linear-AcT maps (calculate_act_maps.py); strengths become lambda in [0, 1]")
     parser.add_argument(
         "--prompts_path",
         type=str,
@@ -410,9 +462,12 @@ def main():
             f"data_dir not found: {args.data_dir}. Run scripts/steering_calculate_klein.sh first."
         )
     print(f"Vector dir contents: {sorted(os.listdir(args.data_dir))}")
-    vector_path = find_vector_file(args.data_dir, args.vector_type)
-    vector = torch.load(vector_path, map_location="cpu", weights_only=False)
-    print(f"Loaded: {vector_path}")
+    if args.act_path:
+        vector = None  # Linear-AcT baseline uses its own maps
+    else:
+        vector_path = find_vector_file(args.data_dir, args.vector_type)
+        vector = torch.load(vector_path, map_location="cpu", weights_only=False)
+        print(f"Loaded: {vector_path}")
     if args.steer_txt or args.strength_txt:
         print("WARNING: --steer_txt / --strength_txt are ignored on Klein (no T5/CLIP encoder).")
 
@@ -481,6 +536,7 @@ def main():
             "t_steering": args.t_steering,
             "steering_type": args.steering_type,
             "use_cls": args.use_cls,
+            "act_path": args.act_path,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.stats_path)), exist_ok=True)
         with open(args.stats_path, "w", encoding="utf-8") as handle:

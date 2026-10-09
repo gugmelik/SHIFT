@@ -11,8 +11,27 @@
 #   textbase  text-only SHIFT baseline on Klein (needs a style tag in STYLE_TAGS)
 #   sweep     alpha_img grid on the VAL prompts, with token-norm and timing stats
 #   ablation  block / step / pooled-vector / text-stream / SVM ablations on VAL (ALPHA)
+#   nameprobe T2I of the VAL prompts + ", in the style of <artist>" (no reference, no steering): does the
+#             model know the style by name? (name_tags.tsv from the downloader) -> val/name_probe
+#   blocks    per-block analysis on VAL at ALPHA (BLOCK_MODES, default "only drop prefix"):
+#             only_k = steer block k alone, drop_k = all blocks except k, first_k = blocks 1..k
+#             -> val/blocks/<cfg>; analysed by scripts/block_analysis.py
 #   test      final run on the TEST prompts with ALPHA, 3 seeds, + I2I teacher images
+#             (teacher per seed in test/teacher/seed_<S>/i2i, same initial noise as the T2I
+#              origin of test/ours/seed_<S>; the old unpaired test/teacher/i2i is kept)
+#   test_rule test run with the alpha chosen by the paper's rule (scripts/select_alpha.py) on
+#             the val sweep -> test/ours_rule/seed_<S>  (RULE_SEEDS, default SEEDS)
 #   score     extended metrics (metrics/eval_klein_extended.py) and Wilcoxon comparison
+#   baselines training-free baselines that need at most one image (BASELINES, default all three):
+#             act        Linear-AcT on Klein from the same pairs (lambda sweep on VAL, test on SEEDS)
+#             casteer    CASteer vectors on SDXL (text pairs; strength sweep on VAL, test seed 42)
+#             ipadapter  IP-Adapter on FLUX.1-dev (one image; scale sweep on VAL, test seed 42)
+#             Each strength is chosen by the same rule as alpha (scripts/select_alpha.py).
+#
+# Same-style stability check (second image of the same artist/style, see the downloader):
+#   python scripts/download_open_references.py --set twins
+#   REF_DIR=data/reference_images/twins EXP_ROOT=experiments/klein_9b/twins SEEDS=42 \
+#     STAGES="extract test score" bash scripts/paper_klein_experiments.sh
 #
 # Rerunning is safe: finished work is detected per reference and per run and skipped
 # (vectors, every alpha/ablation/test folder, teacher images, score files). FORCE=1 redoes it.
@@ -34,7 +53,16 @@ TEST="${TEST:-prompts_collection/klein_style/test_prompts.txt}"
 ALPHAS="${ALPHAS:-2 4 6 7 8 10 12}"
 ALPHA="${ALPHA:-6}"
 SEEDS="${SEEDS:-42 1042 2042}"
-STAGES="${STAGES:-extract textbase sweep ablation test score}"
+STAGES="${STAGES:-extract textbase sweep nameprobe ablation blocks test test_rule score}"
+TEACHER_SEEDS="${TEACHER_SEEDS:-${SEEDS}}"
+RULE_SEEDS="${RULE_SEEDS:-${SEEDS}}"
+BASELINES="${BASELINES:-act casteer ipadapter}"
+ACT_LAMS="${ACT_LAMS:-0.25 0.5 0.75 1}"
+CASTEER_S="${CASTEER_S:-0.05 0.1 0.2 0.4}"
+IP_SCALES="${IP_SCALES:-0.5 0.8 1.0}"
+EXT_SEEDS="${EXT_SEEDS:-42}"
+BLOCK_MODES="${BLOCK_MODES:-only drop prefix}"
+EXP_ROOT="${EXP_ROOT:-experiments/klein_9b/paper}"
 # Open-access (CC0) references: run `python scripts/download_open_references.py` first.
 REF_DIR="${REF_DIR:-data/reference_images/open}"
 # Tab-separated "<reference_stem>\t<suffix>" for the text-SHIFT baseline (written by the downloader)
@@ -103,6 +131,12 @@ calculate() {  # <data_vectors_dir> <out_dir>
       --save_dir "$2" --method diff --timesteps 4 --blocks 8 --n_samples "${n}" --token_stream both --classifier none
 }
 
+# The unsteered T2I image depends only on (prompt, seed), not on the vector or the strength, so
+# it is generated once per (prompt set, seed) and copied into the other run folders.
+reuse_origin() {  # <src_run_dir> <dst_run_dir>
+  if [[ -d "$1/origin" && ! -d "$2/origin" ]]; then mkdir -p "$2"; cp -r "$1/origin" "$2/origin"; fi
+}
+
 apply() {  # <vector_dir> <prompts> <results_dir> <stats_json> [extra args...]
   local vec="$1" prompts="$2" out="$3" stats="$4"; shift 4
   if images_complete "${out}/steered" "${prompts}" && images_complete "${out}/origin" "${prompts}"; then
@@ -119,7 +153,7 @@ apply() {  # <vector_dir> <prompts> <results_dir> <stats_json> [extra args...]
 
 for REF in ${REFS}; do
   STEM="$(basename "${REF%.*}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')"
-  EXP="experiments/klein_9b/paper/${STEM}"
+  EXP="${EXP_ROOT}/${STEM}"
   mkdir -p "${EXP}"
   cp -f "${REF}" "${EXP}/reference.${REF##*.}"
   echo "=== ${STEM} ==="
@@ -138,7 +172,10 @@ for REF in ${REFS}; do
   fi
 
   if has_stage sweep; then
+    FIRST_A=""
     for A in ${ALPHAS}; do
+      [[ -n "${FIRST_A}" ]] && reuse_origin "${EXP}/val/alpha_${FIRST_A}" "${EXP}/val/alpha_${A}"
+      [[ -z "${FIRST_A}" ]] && FIRST_A="${A}"
       apply "${EXP}/ref/vectors" "${VAL}" "${EXP}/val/alpha_${A}" "${EXP}/val/alpha_${A}/stats.json" \
           --strength_img "${A}" --steering_type separate --seed 42
     done
@@ -146,6 +183,9 @@ for REF in ${REFS}; do
 
   if has_stage ablation; then
     V="${EXP}/ref/vectors"; O="${EXP}/val/ablation"
+    for C in blocks_0-3 blocks_4-7 steps_0 steps_0-1 steps_2-3 pooled with_txt svm; do
+      reuse_origin "${EXP}/val/alpha_2" "$O/$C"
+    done
     apply "$V" "${VAL}" "$O/blocks_0-3"  "$O/blocks_0-3/stats.json"  --strength_img "${ALPHA}" --block_steering 0,1,2,3 --seed 42
     apply "$V" "${VAL}" "$O/blocks_4-7"  "$O/blocks_4-7/stats.json"  --strength_img "${ALPHA}" --block_steering 4,5,6,7 --seed 42
     apply "$V" "${VAL}" "$O/steps_0"     "$O/steps_0/stats.json"     --strength_img "${ALPHA}" --t_steering 0 --seed 42
@@ -156,22 +196,142 @@ for REF in ${REFS}; do
     apply "$V" "${VAL}" "$O/svm"         "$O/svm/stats.json"         --strength_img "${ALPHA}" --use_cls --seed 42
   fi
 
+  if has_stage nameprobe; then
+    NT="$(awk -F'\t' -v s="${STEM}" '$1==s {print $2}' "${REF_DIR}/name_tags.tsv" 2>/dev/null || true)"
+    if [[ -z "${NT}" ]]; then
+      echo "  nameprobe: no name tag for ${STEM}; skipped"
+    else
+      D="${EXP}/val/name_probe"; mkdir -p "$D"
+      awk -v t="${NT}" 'NF {print $0 t}' "${VAL}" > "$D/prompts.txt"
+      if images_complete "$D/steered" "$D/prompts.txt"; then skip "$D"; else
+        "${PYTHON}" ./src/steering/apply_steering_klein.py --model_name "${MODEL_NAME}" \
+            --data_dir "${EXP}/ref/vectors" --prompts_path "$D/prompts.txt" --task "add concept" \
+            --inference_steps 4 --guidance_scale 1.0 --width 1024 --height 1024 \
+            --strength 0 --strength_img 0 --results_dir "$D" --seed 42
+      fi
+    fi
+  fi
+
+  if has_stage blocks; then
+    V="${EXP}/ref/vectors"; O="${EXP}/val/blocks"
+    run_blocks() {  # <cfg_name> <comma-separated 0-based blocks>
+      local D="$O/$1"
+      [[ -d "$D/origin" ]] || { mkdir -p "$D"; cp -r "${EXP}/val/alpha_2/origin" "$D/origin"; }
+      apply "$V" "${VAL}" "$D" "$D/stats.json" --strength_img "${ALPHA}" --block_steering "$2" --seed 42
+    }
+    for K in 0 1 2 3 4 5 6 7; do
+      [[ " ${BLOCK_MODES} " == *" only "* ]] && run_blocks "only_$((K + 1))" "$K"
+      if [[ " ${BLOCK_MODES} " == *" drop "* ]]; then
+        run_blocks "drop_$((K + 1))" "$(seq -s, 0 7 | tr ',' '\n' | grep -vx "$K" | paste -sd, -)"
+      fi
+      # first_1 = only_1, first_4 = ablation blocks_0-3, first_8 = main run: not repeated
+      if [[ " ${BLOCK_MODES} " == *" prefix "* ]] && (( K >= 1 && K != 3 && K != 7 )); then
+        run_blocks "first_$((K + 1))" "$(seq -s, 0 "$K")"
+      fi
+    done
+  fi
+
   if has_stage test; then
     for SEED in ${SEEDS}; do
       apply "${EXP}/ref/vectors" "${TEST}" "${EXP}/test/ours/seed_${SEED}" "${EXP}/test/ours/seed_${SEED}/stats.json" \
           --strength_img "${ALPHA}" --steering_type separate --seed "${SEED}"
       if [[ -d "${EXP}/text/vectors" ]]; then
+        reuse_origin "${EXP}/test/ours/seed_${SEED}" "${EXP}/test/shift_text/seed_${SEED}"
         apply "${EXP}/text/vectors" "${TEST}" "${EXP}/test/shift_text/seed_${SEED}" \
             "${EXP}/test/shift_text/seed_${SEED}/stats.json" \
             --strength_img "${ALPHA_TEXTBASE:-${ALPHA}}" --steering_type separate --seed "${SEED}"
       fi
     done
-    if images_complete "${EXP}/test/teacher/i2i" "${TEST}"; then
-      skip "${EXP}/test/teacher"
+    # Teacher (I2I) with seed S + prompt index = the T2I origin of test/ours/seed_S, so content
+    # preservation of the teacher (DINOv2 / LPIPS / DISTS to origin) is measured on a common noise.
+    for SEED in ${TEACHER_SEEDS}; do
+      TD="${EXP}/test/teacher/seed_${SEED}"
+      if images_complete "${TD}/i2i" "${TEST}"; then
+        skip "${TD}"
+      else
+        "${PYTHON}" ./src/steering/get_vector_klein.py --model_name "${MODEL_NAME}" --exp_type style_ref \
+            --prompt_path "${TEST}" --reference_image "${REF}" --height 1024 --width 1024 --gs 1.0 \
+            --num_inference_steps 4 --batch_size 1 --save_image_dir "${TD}" --i2i_only --seed_base "${SEED}"
+      fi
+    done
+  fi
+
+  if has_stage test_rule; then
+    if compgen -G "${EXP}/scores/val_alpha_*.json" >/dev/null; then
+      A_RULE="$("${PYTHON}" scripts/select_alpha.py "${EXP}/scores" --tau "${TAU:-0.85}")"
+      echo "  rule alpha for ${STEM}: ${A_RULE}"
+      echo "${A_RULE}" > "${EXP}/rule_alpha.txt"
+      for SEED in ${RULE_SEEDS}; do
+        RD="${EXP}/test/ours_rule/seed_${SEED}"
+        # reuse the T2I origin images of the main test run (same prompts and seeds)
+        if [[ -d "${EXP}/test/ours/seed_${SEED}/origin" && ! -d "${RD}/origin" ]]; then
+          mkdir -p "${RD}"; cp -r "${EXP}/test/ours/seed_${SEED}/origin" "${RD}/origin"
+        fi
+        apply "${EXP}/ref/vectors" "${TEST}" "${RD}" "${RD}/stats.json" \
+            --strength_img "${A_RULE}" --steering_type separate --seed "${SEED}"
+      done
     else
-      "${PYTHON}" ./src/steering/get_vector_klein.py --model_name "${MODEL_NAME}" --exp_type style_ref \
-          --prompt_path "${TEST}" --reference_image "${REF}" --height 1024 --width 1024 --gs 1.0 \
-          --num_inference_steps 4 --batch_size 1 --save_image_dir "${EXP}/test/teacher" --i2i_only
+      echo "  test_rule: no val scores for ${STEM}; run the sweep and score stages first"
+    fi
+  fi
+
+  if has_stage baselines; then
+    S="${EXP}/scores"; mkdir -p "$S"; B="${EXP}/baselines"
+    CSD_B=(); [[ -n "${CSD_CKPT:-}" ]] && CSD_B=(--csd_ckpt "${CSD_CKPT}")
+    bscore() {  # <out_json> <gen_dir> <origin_dir> <prompts>
+      [[ -f "$1" && "${FORCE_SCORE:-0}" != "1" ]] && { echo "  keep $1"; return 0; }
+      "${PYTHON}" metrics/eval_klein_extended.py score --out "$1" --gen_dir "$2" --origin_dir "$3" \
+          --reference "${REF}" --prompts "$4" "${CSD_B[@]}"
+    }
+    has_b() { [[ " ${BASELINES} " == *" $1 "* ]]; }
+    TAG="$(awk -F'\t' -v s="${STEM}" '$1==s {print $2}' "${STYLE_TAGS}" 2>/dev/null || true)"
+
+    if has_b act; then   # ---- Linear-AcT on Klein, same pairs as the mean-difference vector
+      [[ -f "$B/act/act_maps.pt" ]] || "${PYTHON}" src/steering/calculate_act_maps.py \
+          --data_dir "${EXP}/ref/data_vectors" --out "$B/act/act_maps.pt"
+      for L in ${ACT_LAMS}; do
+        D="$B/act/val/lam_${L}"
+        [[ -d "$D/origin" ]] || { mkdir -p "$D"; cp -r "${EXP}/val/alpha_2/origin" "$D/origin"; }
+        apply "${EXP}/ref/vectors" "${VAL}" "$D" "$D/stats.json" --act_path "$B/act/act_maps.pt" \
+            --strength_img "$L" --seed 42
+        bscore "$S/val_act_${L}.json" "$D/steered" "$D/origin" "${VAL}"
+      done
+      L_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix val_act_ --tau "${TAU:-0.85}")"
+      echo "  AcT rule lambda for ${STEM}: ${L_RULE}"; echo "${L_RULE}" > "$B/act/rule_lambda.txt"
+      for SEED in ${SEEDS}; do
+        D="$B/act/test/seed_${SEED}"
+        [[ -d "$D/origin" ]] || { mkdir -p "$D"; cp -r "${EXP}/test/ours/seed_${SEED}/origin" "$D/origin"; }
+        apply "${EXP}/ref/vectors" "${TEST}" "$D" "$D/stats.json" --act_path "$B/act/act_maps.pt" \
+            --strength_img "${L_RULE}" --seed "${SEED}"
+        bscore "$S/act_seed_${SEED}.json" "$D/steered" "$D/origin" "${TEST}"
+      done
+    fi
+
+    ext_baseline() {  # <method> <strengths> <extra generate args...>
+      local m="$1" strengths="$2"; shift 2
+      "${PYTHON}" src/baselines/external_baselines.py generate --method "$m" --prompts "${VAL}" \
+          --strengths ${strengths} --seed 42 --out "$B/$m/val" "$@"
+      for X in ${strengths}; do
+        bscore "$S/val_${m}_${X}.json" "$B/$m/val/s_${X}" "$B/$m/val/origin" "${VAL}"
+      done
+      local X_RULE; X_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix "val_${m}_" --tau "${TAU:-0.85}")"
+      echo "  ${m} rule strength for ${STEM}: ${X_RULE}"; echo "${X_RULE}" > "$B/$m/rule_strength.txt"
+      for SEED in ${EXT_SEEDS}; do
+        "${PYTHON}" src/baselines/external_baselines.py generate --method "$m" --prompts "${TEST}" \
+            --strengths "${X_RULE}" --seed "${SEED}" --out "$B/$m/test/seed_${SEED}" "$@"
+        bscore "$S/${m}_seed_${SEED}.json" "$B/$m/test/seed_${SEED}/s_${X_RULE}" \
+            "$B/$m/test/seed_${SEED}/origin" "${TEST}"
+      done
+    }
+    if has_b casteer; then   # ---- CASteer vectors on SDXL (text pairs, no image)
+      if [[ -z "${TAG}" ]]; then echo "  casteer: no style tag for ${STEM}; skipped"; else
+        [[ -f "$B/casteer/vectors.pt" ]] || "${PYTHON}" src/baselines/external_baselines.py casteer_extract \
+            --prompts "${TRAIN}" --tag "${TAG}" --out "$B/casteer/vectors.pt"
+        ext_baseline casteer "${CASTEER_S}" --vectors "$B/casteer/vectors.pt"
+      fi
+    fi
+    if has_b ipadapter; then  # ---- IP-Adapter on FLUX.1-dev (one image)
+      ext_baseline ipadapter "${IP_SCALES}" --reference "${REF}" ${IP_ARGS:-}
     fi
   fi
 
@@ -204,7 +364,20 @@ for REF in ${REFS}; do
           --reference "${REF}" --prompts "${VAL}"
     done
 
-    TEACHER="${EXP}/test/teacher/i2i"
+    # per-block analysis runs and the unsteered validation images (T2I reference level)
+    for D in "${EXP}"/val/blocks/*; do
+      has_images "$D/steered" || continue
+      score "$S/val_blk_$(basename "$D").json" --gen_dir "$D/steered" --origin_dir "$D/origin" \
+          --reference "${REF}" --prompts "${VAL}"
+    done
+    has_images "${EXP}/val/name_probe/steered" && score "$S/val_nameprobe.json" \
+        --gen_dir "${EXP}/val/name_probe/steered" --origin_dir "${EXP}/val/alpha_2/origin" \
+        --reference "${REF}" --prompts "${VAL}"
+    has_images "${EXP}/val/alpha_2/origin" && score "$S/val_t2i.json" --gen_dir "${EXP}/val/alpha_2/origin" \
+        --reference "${REF}" --prompts "${VAL}"
+
+    TEACHER="${EXP}/test/teacher/i2i"            # old unpaired teacher (FID target of v2)
+    has_images "${TEACHER}" || TEACHER="${EXP}/test/teacher/seed_42/i2i"
     FID_ARGS=()
     has_images "${TEACHER}" && FID_ARGS=(--fid_target_dir "${TEACHER}")
     for SEED in ${SEEDS}; do
@@ -214,20 +387,29 @@ for REF in ${REFS}; do
         score "$S/${M}_seed_${SEED}.json" --gen_dir "$D/steered" --origin_dir "$D/origin" \
             --reference "${REF}" --prompts "${TEST}" "${FID_ARGS[@]}"
       done
+      D="${EXP}/test/ours_rule/seed_${SEED}"
+      has_images "$D/steered" && score "$S/ours_rule_seed_${SEED}.json" --gen_dir "$D/steered" \
+          --origin_dir "${EXP}/test/ours/seed_${SEED}/origin" --reference "${REF}" --prompts "${TEST}" \
+          "${FID_ARGS[@]}"
       D="${EXP}/test/ours/seed_${SEED}/origin"
       has_images "$D" && score "$S/t2i_seed_${SEED}.json" --gen_dir "$D" \
           --reference "${REF}" --prompts "${TEST}" "${FID_ARGS[@]}"
+      # paired teacher: same noise as the origin above -> content metrics are defined
+      D="${EXP}/test/teacher/seed_${SEED}/i2i"
+      has_images "$D" && score "$S/teacher_seed_${SEED}.json" --gen_dir "$D" \
+          --origin_dir "${EXP}/test/ours/seed_${SEED}/origin" --reference "${REF}" --prompts "${TEST}"
     done
-    has_images "${TEACHER}" && score "$S/teacher.json" --gen_dir "${TEACHER}" \
+    has_images "${EXP}/test/teacher/i2i" && score "$S/teacher.json" --gen_dir "${EXP}/test/teacher/i2i" \
         --reference "${REF}" --prompts "${TEST}"
 
     if [[ -f "$S/ours_seed_42.json" && -f "$S/t2i_seed_42.json" ]]; then
       RUNS=("$S/ours_seed_42.json" "$S/t2i_seed_42.json")
-      [[ -f "$S/teacher.json" ]] && RUNS+=("$S/teacher.json")
+      if [[ -f "$S/teacher_seed_42.json" ]]; then RUNS+=("$S/teacher_seed_42.json")
+      elif [[ -f "$S/teacher.json" ]]; then RUNS+=("$S/teacher.json"); fi
       [[ -f "$S/shift_text_seed_42.json" ]] && RUNS+=("$S/shift_text_seed_42.json")
       "${PYTHON}" metrics/eval_klein_extended.py compare --runs "${RUNS[@]}" --out "$S/compare_seed_42.json"
     fi
   fi
 done
 
-echo "Done. Results under experiments/klein_9b/paper/"
+echo "Done. Results under ${EXP_ROOT}/"

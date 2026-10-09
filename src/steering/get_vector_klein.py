@@ -230,10 +230,14 @@ def run_extraction(
             batch = prompts[i : i + args.batch_size]
             if manager is not None:
                 manager.reset_state()
-            generators = [
-                torch.Generator(device).manual_seed(42000 + i * 10 + j)
-                for j in range(len(batch))
-            ]
+            # Default: the extraction seeds (identical for the pos and neg pass).
+            # --seed_base S: seed S + prompt_index, the same rule as apply_steering_klein.py
+            # (--seed S), so teacher I2I images share the initial noise with the T2I origin.
+            if getattr(args, "seed_base", None) is not None:
+                seeds = [int(args.seed_base) + i + j for j in range(len(batch))]
+            else:
+                seeds = [42000 + i * 10 + j for j in range(len(batch))]
+            generators = [torch.Generator(device).manual_seed(s) for s in seeds]
             call_kwargs = dict(
                 prompt=batch,
                 num_inference_steps=args.num_inference_steps,
@@ -361,6 +365,13 @@ def parse_args():
         help="Double-stream blocks to hook (Klein 9B has 8)",
     )
     parser.add_argument("--save_timesteps", type=int, default=4)
+    parser.add_argument(
+        "--seed_base",
+        type=int,
+        default=None,
+        help="Seed of prompt k is seed_base + k (as --seed in apply_steering_klein.py). "
+        "Default: extraction seeds 42000 + 10*k. Use it for teacher images paired with T2I.",
+    )
     parser.add_argument("--save_dir", type=str, default="experiments/klein_9b/style/data_vectors")
     parser.add_argument("--save_image_dir", type=str, default=None)
     parser.add_argument(
@@ -420,7 +431,8 @@ def main():
         )
         save_grid(pos_imgs, os.path.join(args.save_image_dir, f"positive_{args.exp_type}_{n_prompts}_grid.png"))
         with open(os.path.join(args.save_image_dir, "i2i_timing.json"), "w", encoding="utf-8") as handle:
-            json.dump({"seconds": args.batch_seconds, "mode": "i2i"}, handle, indent=2)
+            json.dump({"seconds": args.batch_seconds, "mode": "i2i", "seed_base": args.seed_base},
+                      handle, indent=2)
         print("Done.")
         return
 

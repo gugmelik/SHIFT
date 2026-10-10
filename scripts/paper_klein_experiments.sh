@@ -59,7 +59,7 @@ RULE_SEEDS="${RULE_SEEDS:-${SEEDS}}"
 BASELINES="${BASELINES:-act casteer ipadapter}"
 ACT_LAMS="${ACT_LAMS:-0.25 0.5 0.75 1}"
 CASTEER_S="${CASTEER_S:-0.05 0.1 0.2 0.4}"
-IP_SCALES="${IP_SCALES:-0.5 0.8 1.0}"
+IP_SCALES="${IP_SCALES:-0.1 0.2 0.3 0.5 0.8 1.0}"
 EXT_SEEDS="${EXT_SEEDS:-42}"
 BLOCK_MODES="${BLOCK_MODES:-only drop prefix}"
 EXP_ROOT="${EXP_ROOT:-experiments/klein_9b/paper}"
@@ -258,8 +258,9 @@ for REF in ${REFS}; do
 
   if has_stage test_rule; then
     if compgen -G "${EXP}/scores/val_alpha_*.json" >/dev/null; then
-      A_RULE="$("${PYTHON}" scripts/select_alpha.py "${EXP}/scores" --tau "${TAU:-0.85}")"
-      echo "  rule alpha for ${STEM}: ${A_RULE}"
+      A_RULE="$("${PYTHON}" scripts/select_alpha.py "${EXP}/scores" --tau "${TAU:-0.85}" \
+          --fallback --note "${EXP}/rule_alpha_note.txt")"
+      echo "  rule alpha for ${STEM}: ${A_RULE} ($(cut -f2 "${EXP}/rule_alpha_note.txt"))"
       echo "${A_RULE}" > "${EXP}/rule_alpha.txt"
       for SEED in ${RULE_SEEDS}; do
         RD="${EXP}/test/ours_rule/seed_${SEED}"
@@ -296,8 +297,9 @@ for REF in ${REFS}; do
             --strength_img "$L" --seed 42
         bscore "$S/val_act_${L}.json" "$D/steered" "$D/origin" "${VAL}"
       done
-      L_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix val_act_ --tau "${TAU:-0.85}")"
-      echo "  AcT rule lambda for ${STEM}: ${L_RULE}"; echo "${L_RULE}" > "$B/act/rule_lambda.txt"
+      L_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix val_act_ --tau "${TAU:-0.85}" \
+          --fallback --note "$B/act/rule_lambda.txt")"
+      echo "  AcT lambda for ${STEM}: ${L_RULE} ($(cut -f2 "$B/act/rule_lambda.txt"))"
       for SEED in ${SEEDS}; do
         D="$B/act/test/seed_${SEED}"
         [[ -d "$D/origin" ]] || { mkdir -p "$D"; cp -r "${EXP}/test/ours/seed_${SEED}/origin" "$D/origin"; }
@@ -316,8 +318,9 @@ for REF in ${REFS}; do
         local XG; XG="$("${PYTHON}" -c 'import sys; print(f"{float(sys.argv[1]):g}")' "$X")"
         bscore "$S/val_${m}_${XG}.json" "$B/$m/val/s_${XG}" "$B/$m/val/origin" "${VAL}"
       done
-      local X_RULE; X_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix "val_${m}_" --tau "${TAU:-0.85}")"
-      echo "  ${m} rule strength for ${STEM}: ${X_RULE}"; echo "${X_RULE}" > "$B/$m/rule_strength.txt"
+      local X_RULE; X_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix "val_${m}_" --tau "${TAU:-0.85}" \
+          --fallback --note "$B/$m/rule_strength.txt")"
+      echo "  ${m} strength for ${STEM}: ${X_RULE} ($(cut -f2 "$B/$m/rule_strength.txt"))"
       for SEED in ${EXT_SEEDS}; do
         "${PYTHON}" src/baselines/external_baselines.py generate --method "$m" --prompts "${TEST}" \
             --strengths "${X_RULE}" --seed "${SEED}" --out "$B/$m/test/seed_${SEED}" "$@"

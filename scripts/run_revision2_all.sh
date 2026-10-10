@@ -58,6 +58,10 @@ run analysis bash -c '
   for d in experiments/klein_9b/paper/*/; do
     echo "$(basename $d): gram $($PYTHON scripts/select_alpha.py $d/scores) / csd $($PYTHON scripts/select_alpha.py $d/scores --metric csd)"
   done > paper_results/rule_alpha.txt
+  for d in experiments/klein_9b/paper/*/; do n=$(basename $d)
+    for f in $d/rule_alpha_note.txt $d/baselines/*/rule_*.txt; do
+      [[ -f $f ]] && echo "$n	${f#$d}	$(cat $f)"; done
+  done > paper_results/strength_selection.tsv
   nvidia-smi --query-gpu=name,memory.total --format=csv > paper_results/gpu.txt
   pip freeze > paper_results/pip_freeze.txt'
 # figure inputs for the qualitative comparison with baselines (prompts 0 and 10, seed 42)

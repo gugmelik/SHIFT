@@ -312,7 +312,9 @@ for REF in ${REFS}; do
       "${PYTHON}" src/baselines/external_baselines.py generate --method "$m" --prompts "${VAL}" \
           --strengths ${strengths} --seed 42 --out "$B/$m/val" "$@"
       for X in ${strengths}; do
-        bscore "$S/val_${m}_${X}.json" "$B/$m/val/s_${X}" "$B/$m/val/origin" "${VAL}"
+        # folder names follow external_baselines.py: f"s_{strength:g}" (1.0 -> s_1)
+        local XG; XG="$("${PYTHON}" -c 'import sys; print(f"{float(sys.argv[1]):g}")' "$X")"
+        bscore "$S/val_${m}_${XG}.json" "$B/$m/val/s_${XG}" "$B/$m/val/origin" "${VAL}"
       done
       local X_RULE; X_RULE="$("${PYTHON}" scripts/select_alpha.py "$S" --prefix "val_${m}_" --tau "${TAU:-0.85}")"
       echo "  ${m} rule strength for ${STEM}: ${X_RULE}"; echo "${X_RULE}" > "$B/$m/rule_strength.txt"

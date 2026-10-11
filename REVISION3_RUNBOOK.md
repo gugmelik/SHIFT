@@ -15,8 +15,9 @@ Linear-AcT / CASteer / IP-Adapter, twins, rule runs):
 The revision-3 code is not in git yet.
 
     git add scripts/run_revision3.sh scripts/revision3_analysis.py scripts/make_limits_figure.py \
-            scripts/make_revision3_tables.py scripts/make_vecsim_figure.py \
-            src/steering/apply_steering_klein.py REVISION3_RUNBOOK.md
+            scripts/make_revision3_tables.py scripts/make_vecsim_figure.py scripts/run_revision3_4gpu.sh \
+            src/steering/apply_steering_klein.py scripts/download_open_references.py REVISION3_RUNBOOK.md \
+            .gitignore data/reference_images/open/
     git commit -m "Revision 3: angle-matched control, held-out block check, SHIFT rule, prereq stage"
     git push origin flux-klein
 
@@ -38,22 +39,15 @@ GPU ≥ 48 GB (L40S as in Table 2), ~200 GB disk, RAM ≥ 64 GB.
     git clone https://github.com/learn2phoenix/CSD third_party/CSD
     huggingface-cli login        # licences accepted: FLUX.2-klein-9B, dinov3-vitl16-pretrain-lvd1689m
     huggingface-cli download tomg-group-umd/CSD-ViT-L pytorch_model.bin --local-dir weights/csd
-    # the same 4 references as in the paper; the two Commons files are pinned so the lookup cannot pick another image
-    python scripts/download_open_references.py --commons_file \
-        pirosmani_giraffe=File:Pirosmani_-_Giraffe.jpg ciurlionis_sonata_sun=File:Saules_sonata.Andante.jpg
-    ls data/reference_images/open/    # exactly: ciurlionis_sonata_sun, monet_water_lilies, pirosmani_giraffe, vangogh_self_portrait
+    # The 4 references are in the repository (data/reference_images/open/, byte-identical to the images
+    # of the revision-2 run): do NOT run download_open_references.py, it would overwrite them.
+    ls data/reference_images/open/*.jpg && cat data/reference_images/open/style_tags.tsv   # 4 + 4 lines
     tmux new -s rev3
     bash scripts/run_revision3.sh
 
-Several GPUs (one reference each), then the analysis once:
+Four GPUs on one machine (one reference per GPU, then the analysis once; ~4.5 h on a new pod, ~3.5 h on the old volume):
 
-    R=data/reference_images/open
-    CUDA_VISIBLE_DEVICES=0 REFS="$R/monet_water_lilies.jpg"    STAGES="prereq angle blocks_test shift_sweep score examples" bash scripts/run_revision3.sh > logs/g0.log 2>&1 &
-    CUDA_VISIBLE_DEVICES=1 REFS="$R/vangogh_self_portrait.jpg" STAGES="prereq angle blocks_test shift_sweep score examples" bash scripts/run_revision3.sh > logs/g1.log 2>&1 &
-    CUDA_VISIBLE_DEVICES=2 REFS="$R/ciurlionis_sonata_sun.jpg" STAGES="prereq angle blocks_test shift_sweep score examples" bash scripts/run_revision3.sh > logs/g2.log 2>&1 &
-    CUDA_VISIBLE_DEVICES=3 REFS="$R/pirosmani_giraffe.jpg"     STAGES="prereq angle blocks_test shift_sweep score examples" bash scripts/run_revision3.sh > logs/g3.log 2>&1 &
-    wait
-    STAGES=analysis bash scripts/run_revision3.sh
+    bash scripts/run_revision3_4gpu.sh          # progress: tail -f logs/rev3_gpu*.log ; nvidia-smi
 
 On a new pod the vectors are re-extracted with the same prompts and seeds; the held-out block
 configurations and the angle control are compared with the "ours"/T2I runs of the SAME pod, so the

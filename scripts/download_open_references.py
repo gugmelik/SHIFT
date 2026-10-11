@@ -112,16 +112,36 @@ SETS = {"main": (REFERENCES, "data/reference_images/open"),
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 
 
+def _retry(fn, url, tries=5):
+    """The AIC IIIF server and Commons time out now and then: retry with a growing pause."""
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - timeouts, resets, 5xx
+            if attempt == tries:
+                raise
+            wait = 10 * attempt
+            print(f"     retry {attempt}/{tries - 1} in {wait} s ({exc}): {url}", file=sys.stderr)
+            time.sleep(wait)
+
+
 def get_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)
+    def go():
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    return _retry(go, url)
 
 
 def download(url: str, path: Path) -> None:
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        path.write_bytes(resp.read())
+    def go():
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+        tmp = path.with_suffix(path.suffix + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    _retry(go, url)
 
 
 def _ascii(text: str) -> str:

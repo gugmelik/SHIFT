@@ -16,6 +16,7 @@ data/reference_images/open/*
 !data/reference_images/open/references.bib
 !data/reference_images/open/sources.json
 !data/reference_images/open/style_tags.tsv
+!data/reference_images/open/name_tags.tsv
 remove_experiments/
 remove_experiments_flux_schnell/
 style_experiments/

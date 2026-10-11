@@ -303,6 +303,10 @@ def cmd_score(args) -> None:
                 if origin and need("lpips_to_origin") else None)
     dists_fn = (try_build(lambda: __import__("piq").DISTS().to(device), "DISTS")
                 if origin and need("dists_to_origin") else None)
+    if args.dinov3_id and ref_img is not None and dinov3 is None and need("dinov3_to_reference") \
+            and not args.allow_missing:
+        sys.exit("DINOv3 was requested but could not be loaded (gated model: accept the licence of "
+                 f"{args.dinov3_id} on huggingface.co and `huggingface-cli login`), or pass --allow_missing.")
     if args.csd_ckpt and csd is None and need("csd_to_reference") and ref_img is not None:
         sys.exit("CSD was requested (--csd_ckpt) but could not be loaded; see the warning above.")
 
@@ -438,6 +442,7 @@ def main():
     s.add_argument("--clip_id", default="openai/clip-vit-large-patch14")
     s.add_argument("--csd_ckpt", default=None)
     s.add_argument("--n_boot", type=int, default=10000)
+    s.add_argument("--allow_missing", action="store_true", help="Skip metrics whose model fails to load")
     s.add_argument("--merge", action="store_true",
                    help="If --out exists, keep its metrics and compute only the missing ones (e.g. add CSD)")
     s.add_argument("--out", required=True)

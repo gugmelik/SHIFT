@@ -280,9 +280,15 @@ for REF in ${REFS}; do
     S="${EXP}/scores"; mkdir -p "$S"; B="${EXP}/baselines"
     CSD_B=(); [[ -n "${CSD_CKPT:-}" ]] && CSD_B=(--csd_ckpt "${CSD_CKPT}")
     bscore() {  # <out_json> <gen_dir> <origin_dir> <prompts>
-      [[ -f "$1" && "${FORCE_SCORE:-0}" != "1" ]] && { echo "  keep $1"; return 0; }
+      local extra=()
+      if [[ -f "$1" && "${FORCE_SCORE:-0}" != "1" ]]; then
+        if grep -q '"dinov3_to_reference"' "$1" && { [[ -z "${CSD_CKPT:-}" ]] || grep -q '"csd_to_reference"' "$1"; }; then
+          echo "  keep $1"; return 0
+        fi
+        extra=(--merge)
+      fi
       "${PYTHON}" metrics/eval_klein_extended.py score --out "$1" --gen_dir "$2" --origin_dir "$3" \
-          --reference "${REF}" --prompts "$4" "${CSD_B[@]}"
+          --reference "${REF}" --prompts "$4" "${CSD_B[@]}" "${extra[@]}"
     }
     has_b() { [[ " ${BASELINES} " == *" $1 "* ]]; }
     TAG="$(awk -F'\t' -v s="${STEM}" '$1==s {print $2}' "${STYLE_TAGS}" 2>/dev/null || true)"
@@ -350,8 +356,15 @@ for REF in ${REFS}; do
     score() {  # <out_json> <args...>
       local out="$1"; shift
       if [[ -f "${out}" && "${FORCE_SCORE:-0}" != "1" ]]; then
-        if [[ -n "${CSD_CKPT:-}" ]] && ! grep -q '"csd_to_reference"' "${out}"; then
-          echo "  add CSD to ${out}"
+        # --merge keeps every stored metric and computes only the missing ones (e.g. DINOv3 or CSD
+        # that failed to load in an earlier run); it loads no model when nothing is missing.
+        local need=0
+        for m in dinov2_to_reference dinov3_to_reference gram_to_reference clip_text; do
+          grep -q "\"$m\"" "${out}" || need=1
+        done
+        [[ -n "${CSD_CKPT:-}" ]] && ! grep -q '"csd_to_reference"' "${out}" && need=1
+        if (( need )); then
+          echo "  add missing metrics to ${out}"
           "${PYTHON}" metrics/eval_klein_extended.py score --out "${out}" --merge "${CSD_ARGS[@]}" "$@"
         else
           echo "  keep ${out}"

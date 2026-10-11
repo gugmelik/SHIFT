@@ -181,6 +181,23 @@ def apply_steering(
     return (steered_unit * orig_norm).to(dtype)
 
 
+def rotate_towards(activations: torch.Tensor, steering_vec: torch.Tensor, angle_deg: float) -> torch.Tensor:
+    """Angle-matched control (revision 3): rotate every token h by exactly `angle_deg` in the
+    plane of h and the steering direction, towards the component of v orthogonal to h.
+    The norm of h is kept, so the intervention has the same angle in every block and token,
+    whatever ||h|| is (cf. eq. (12): with renormalised addition the angle depends on alpha/||h||)."""
+    dtype = activations.dtype
+    h = torch.nan_to_num(activations.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    v = torch.nan_to_num(steering_vec.float(), nan=0.0, posinf=0.0, neginf=0.0).expand_as(h)
+    h_norm = torch.norm(h, dim=-1, keepdim=True).clamp(min=1e-6)
+    u = h / h_norm
+    w = v - (v * u).sum(-1, keepdim=True) * u
+    w = w / torch.norm(w, dim=-1, keepdim=True).clamp(min=1e-6)
+    th = torch.tensor(np.deg2rad(angle_deg), device=h.device, dtype=h.dtype)
+    out = h_norm * (torch.cos(th) * u + torch.sin(th) * w)
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).to(dtype)
+
+
 def apply_act_steering(pipe, args, norm_log=None):
     """Linear-AcT baseline: h' = (1 - lam) h + lam (omega * h + beta) per unit, on every token of
     the stream; lam = --strength_img (image stream) and --strength (text stream).
@@ -344,11 +361,16 @@ def apply_attention_steering(pipe, args, vector, norm_log=None):
                     args.task,
                     score_val=_get_score_val(step, layer_idx, txt_hidden, "txt"),
                 )
-            if sv_img is not None and args.strength_img != 0:
+            if sv_img is not None and getattr(args, "angle_deg", None) is not None:
+                img_new = rotate_towards(img_hidden, _prepare_vec(sv_img, img_hidden), args.angle_deg)
+            elif sv_img is not None and args.strength_img != 0:
+                a_img = args.strength_img
+                if getattr(args, "strength_img_blocks", None):
+                    a_img = args.strength_img_blocks[layer_idx]
                 img_new = apply_steering(
                     img_hidden,
                     _prepare_vec(sv_img, img_hidden),
-                    args.strength_img,
+                    a_img,
                     args.task,
                     score_val=_get_score_val(step, layer_idx, img_hidden, "img"),
                 )
@@ -411,6 +433,11 @@ def parse_args():
     parser.add_argument("--use_cls", action="store_true", help="Scale steering by SVM classifier score.")
     parser.add_argument("--cls_min", type=float, default=20.0)
     parser.add_argument("--cls_type", type=str, default="tanh")
+    parser.add_argument("--angle_deg", type=float, default=None,
+                        help="Angle-matched control: rotate image-stream tokens by exactly this angle "
+                             "(degrees) towards the steering direction in every steered block; overrides --strength_img.")
+    parser.add_argument("--strength_img_blocks", type=str, default=None,
+                        help="Comma-separated per-block image strengths (8 values, block order); overrides --strength_img.")
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--block_steering", type=str, default="all")
     parser.add_argument("--t_steering", type=str, default="all")
@@ -456,6 +483,8 @@ def main():
         args.block_steering = [int(x) for x in args.block_steering.split(",")]
     if args.t_steering != "all":
         args.t_steering = [int(x) for x in args.t_steering.split(",")]
+    if args.strength_img_blocks:
+        args.strength_img_blocks = [float(x) for x in args.strength_img_blocks.split(",")]
 
     Flux2KleinPipeline = _import_klein_pipeline()
     print(f"Loading {args.model_name}...")
@@ -542,6 +571,8 @@ def main():
             "strength": args.strength,
             "strength_img": args.strength_img,
             "block_steering": args.block_steering,
+            "angle_deg": getattr(args, "angle_deg", None),
+            "strength_img_blocks": getattr(args, "strength_img_blocks", None),
             "t_steering": args.t_steering,
             "steering_type": args.steering_type,
             "use_cls": args.use_cls,
